@@ -1,0 +1,18 @@
+# npm install artifacts
+node_modules/
+
+# npm debug + publish scratch
+npm-debug.log*
+*.tgz
+.npm/
+
+# Project-specific instructions kept locally, not in the repo
+CLAUDE.md
+
+# Editor / OS cruft
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

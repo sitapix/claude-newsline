@@ -1,0 +1,41 @@
+name: publish
+
+# Fires on version tags created by `npm version <patch|minor|major>`. The
+# tag format must be `v<semver>` so GitHub sees it as a version. Tests run
+# first; if anything fails, nothing gets published.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # required for npm provenance attestation
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Run tests
+        run: ./test.sh
+
+      - name: Verify tag matches package.json version
+        run: |
+          tag_ver="${GITHUB_REF_NAME#v}"
+          pkg_ver=$(node -p "require('./package.json').version")
+          if [ "$tag_ver" != "$pkg_ver" ]; then
+            echo "Tag version ($tag_ver) does not match package.json version ($pkg_ver)" >&2
+            exit 1
+          fi
+
+      - name: Publish to npm
+        run: npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

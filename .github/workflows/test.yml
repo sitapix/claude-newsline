@@ -1,0 +1,30 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: ['18', '20', '22']
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Ensure jq is available
+        run: command -v jq || (sudo apt-get update && sudo apt-get install -y jq)
+        if: runner.os == 'Linux'
+      - name: ShellCheck
+        # Ubuntu runners ship shellcheck. Only run once per matrix row by
+        # scoping to Linux + the lowest Node — catches regressions without
+        # multiplying the same lint failure across 6 jobs.
+        run: shellcheck bin/statusline.sh bin/colors.sh
+        if: runner.os == 'Linux' && matrix.node == '18'
+      - run: ./test.sh
