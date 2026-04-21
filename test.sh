@@ -433,9 +433,13 @@ assert_not_contains "$out" "HN •" "no label prefix when label is empty"
 }
 section "NEWSLINE_COLOR_FEED override" && {
 prime_cache "HN" "Color Test" "https://example.com/c"
-out=$(NEWSLINE_COLOR_FEED=magenta bash "$STATUSLINE" </dev/null)
+# FORCE_COLOR=1: CI runners set TERM=dumb → COLOR_DEPTH=0 → colors.sh suppresses
+# everything (by design — see NO_COLOR/dumb handling). The `=none` test below
+# still passes without it because "expect no color" holds trivially; the two
+# positive assertions need color forced on.
+out=$(FORCE_COLOR=1 NEWSLINE_COLOR_FEED=magenta bash "$STATUSLINE" </dev/null)
 assert_contains "$out" $'\e[35m' "NEWSLINE_COLOR_FEED=magenta emits ESC[35m"
-out=$(NEWSLINE_COLOR_FEED="38;5;208" bash "$STATUSLINE" </dev/null)
+out=$(FORCE_COLOR=1 NEWSLINE_COLOR_FEED="38;5;208" bash "$STATUSLINE" </dev/null)
 assert_contains "$out" $'\e[38;5;208m' "NEWSLINE_COLOR_FEED accepts raw ANSI SGR params"
 out=$(NEWSLINE_COLOR_FEED=none bash "$STATUSLINE" </dev/null)
 assert_not_contains "$out" $'\e[33m' "NEWSLINE_COLOR_FEED=none suppresses the color code"
