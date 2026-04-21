@@ -164,15 +164,18 @@ echo
 echo "=== statusline.sh ==="
 
 section "colors.sh is sourceable standalone" && {
-out=$(sh -c ". $SCRIPT_DIR/bin/colors.sh && set_ansi x red && printf '%s' \"\$x\"")
+# FORCE_COLOR=1 pins COLOR_DEPTH to 4 (16-color). CI runners have TERM=dumb and
+# no COLORTERM, which legitimately resolves to COLOR_DEPTH=0 — these tests
+# assert set_ansi's mapping, not the depth detector, so force the depth.
+out=$(sh -c "FORCE_COLOR=1 . $SCRIPT_DIR/bin/colors.sh && set_ansi x red && printf '%s' \"\$x\"")
 expected=$(printf '\033[31m')
 assert_equals "$out" "$expected" "set_ansi red → ESC[31m"
 
-out=$(sh -c ". $SCRIPT_DIR/bin/colors.sh && set_ansi x bold_green && printf '%s' \"\$x\"")
+out=$(sh -c "FORCE_COLOR=1 . $SCRIPT_DIR/bin/colors.sh && set_ansi x bold_green && printf '%s' \"\$x\"")
 expected=$(printf '\033[1;32m')
 assert_equals "$out" "$expected" "set_ansi bold_green → ESC[1;32m"
 
-out=$(sh -c ". $SCRIPT_DIR/bin/colors.sh && set_ansi x '38;5;208' && printf '%s' \"\$x\"")
+out=$(sh -c "FORCE_COLOR=1 . $SCRIPT_DIR/bin/colors.sh && set_ansi x '38;5;208' && printf '%s' \"\$x\"")
 expected=$(printf '\033[38;5;208m')
 assert_equals "$out" "$expected" "set_ansi accepts raw SGR params"
 
