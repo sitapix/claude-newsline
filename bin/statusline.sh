@@ -265,12 +265,15 @@ _SCRIPT_DIR=$(CDPATH=; cd -- "$(dirname -- "$_script")" && pwd)
 
 TAB=$(printf '\t')
 
-# BSD (stat -f %m) and GNU (stat -c %Y) disagree on the flag for %epoch-modified;
-# try the BSD form first, fall through to GNU, degrade to 0 so the caller
-# still has a number to do arithmetic with. A missing file also returns 0,
-# which is exactly what the staleness check wants.
+# BSD (stat -f %m) and GNU (stat -c %Y) disagree on the flag for %epoch-modified.
+# GNU goes first: on BSD, `-c` is unknown → stderr-only → clean nonzero → fallback
+# runs. The reverse order is unsafe because GNU's `-f` means *filesystem status*,
+# not format: `stat -f %m FILE` partially succeeds, dumps verbose filesystem info
+# to stdout, and poisons $(mtime_of ...). Degrade to 0 so the caller still has a
+# number to do arithmetic with. A missing file also returns 0, which is exactly
+# what the staleness check wants.
 mtime_of() {
-  stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0
+  stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0
 }
 
 is_disabled() {
