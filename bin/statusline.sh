@@ -96,6 +96,7 @@ feed_reddit() {
 # feed: write feed_<name>() taking $1, add a config line reading
 # `INTERNAL="${NEWSLINE_INTERNAL:-default}"`, and set
 # FEED_PARAMS_<name>='INTERNAL'. No dispatch-loop changes needed.
+# shellcheck disable=SC2034  # Referenced indirectly via eval in refresh_all_feeds.
 FEED_PARAMS_reddit='REDDIT_SUBS'
 feed_lobsters() {
   LABEL='Lobsters'
@@ -386,7 +387,7 @@ refresh_all_feeds() {
       eval "_params_val=\${$_params_var:-}"
       _old_ifs=$IFS
       IFS=','
-      # shellcheck disable=SC2086
+      # shellcheck disable=SC2086,SC2154  # Word-split intentional; _params_val assigned via eval above.
       set -- $_params_val
       IFS=$_old_ifs
       for _p in "$@"; do
