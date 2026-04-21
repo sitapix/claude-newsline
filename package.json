@@ -1,6 +1,6 @@
 {
   "name": "@sitapix/claude-newsline",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A Claude Code status line add-on that appends a rotating HN / r/programming / Lobsters headline",
   "bin": {
     "claude-newsline": "bin/claude-newsline.js"
