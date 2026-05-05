@@ -17,7 +17,6 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const readline = require('readline');
 
 // SGR-code-named colors, mirroring colors.sh's set_ansi(). Used by the
 // --color flag and wizard preview. Empty strings mean "no SGR" (none/off).
@@ -166,6 +165,187 @@ function loadShDefault(externalName, fallback) {
   const re = new RegExp(`"\\$\\{${externalName}(?::-|-)([^}]*)\\}"`, 'm');
   const m = readStatuslineSrc().match(re);
   return m ? m[1] : fallback;
+}
+
+// POSIX function-name rule, shared by load_user_feeds (sh) and the Node side
+// so filename validation stays in lockstep. A file the installer would accept
+// that sh would reject is a user-visible drift.
+const FEED_NAME_REGEX = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+// Plugin-contract version. Mirrors `FEED_API_VERSION=<N>` in statusline.sh —
+// a test asserts the two stay in lockstep. The sh side is canonical (it
+// gates loading at runtime), the JS side mirrors so the installer doesn't
+// surface plugins the runtime would then silently skip. Absent / non-
+// numeric `api` in a plugin's FEED_META is treated as 1 (backward compat
+// with plugins written before this gate existed).
+function loadFeedApiVersion() {
+  const m = readStatuslineSrc().match(/^FEED_API_VERSION=(\d+)/m);
+  return m ? Number(m[1]) : 1;
+}
+const FEED_API_VERSION = loadFeedApiVersion();
+
+// Parse `api=<N>` out of a parsed FEED_META object. Returns the integer
+// api version, or 1 when absent/non-numeric (implicit v1). Kept separate
+// from parseFeedMeta so callers that don't care about gating don't pay
+// the parse cost, and so the "absent means 1" convention has one home.
+function pluginApiVersion(meta) {
+  const raw = meta && meta.api;
+  if (typeof raw !== 'string' || raw === '') return 1;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : 1;
+}
+
+// Probe a user plugin in a subprocess and make sure it matches the runtime
+// loader's basic contract: the file must source cleanly and define
+// feed_<name>(). The subprocess keeps side effects out of the installer
+// process, but this still executes plugin shell code, same trust boundary as
+// statusline.sh's load_user_feeds.
+function probeUserFeed(pathname, name) {
+  const { spawnSync } = require('child_process');
+  const script = '. "$1" >/dev/null 2>/dev/null || exit 10\ncommand -v "feed_$2" >/dev/null 2>&1 || exit 11';
+  const r = spawnSync('sh', ['-c', script, 'sh', pathname, name], {
+    stdio: 'ignore',
+    timeout: 2000,
+  });
+  if (r.error) {
+    if (r.error.code === 'ETIMEDOUT') return { ok: false, reason: 'source timed out' };
+    return { ok: false, reason: r.error.message || 'source failed' };
+  }
+  if (r.status === 0) return { ok: true };
+  if (r.status === 10) return { ok: false, reason: 'source failed' };
+  if (r.status === 11) return { ok: false, reason: `feed_${name} function not defined` };
+  return { ok: false, reason: `source failed (exit ${r.status == null ? 'unknown' : r.status})` };
+}
+
+// Scan EVERY *.sh in the user-feeds directory that passes the filename
+// rule — loadable AND incompatible alike — tagged with a compat status.
+// Returns `[{name, path, meta, compat}]` sorted by name, where `compat` is
+// `{ok:true}` for loadable plugins or `{ok:false, reason, ...}` for ones
+// the runtime would skip. Incompatible plugins are INCLUDED so --list-feeds
+// can render an "Incompatible" section — a silent-skip would leave users
+// with no signal about why their dropped-in plugin isn't running. Most
+// callers want only loadable plugins; use `scanUserFeeds` (filter wrapper)
+// for that.
+//
+// Skip paths mirror sh-side load_user_feeds:
+//   1. Filename fails the POSIX rule — we skip entirely here (not surfaced)
+//      because sh would silently reject too and the file isn't a plugin
+//      the author intended us to run. Different class of problem from
+//      "api too new."
+//   2. Unreadable file — skipped entirely for the same reason (author bug,
+//      not a compat signal).
+//   3. Source failure / missing feed_<name> — INCLUDED, tagged incompatible
+//      so --list-feeds can explain why the file will not load.
+//   4. `api=` declaration > FEED_API_VERSION — INCLUDED, tagged
+//      `{ok:false, reason:'api', declaredApi, runtimeApi}` so callers can
+//      render the "drop-in-but-wont-load" state.
+function scanAllUserFeeds(userFeedsDir) {
+  let entries;
+  try {
+    entries = fs.readdirSync(userFeedsDir);
+  } catch (e) {
+    if (e.code === 'ENOENT' || e.code === 'ENOTDIR') return [];
+    throw e;
+  }
+  const out = [];
+  for (const entry of entries) {
+    if (!entry.endsWith('.sh')) continue;
+    const name = entry.slice(0, -3);
+    if (!FEED_NAME_REGEX.test(name)) continue;
+    const p = path.join(userFeedsDir, entry);
+    let src;
+    try { src = fs.readFileSync(p, 'utf8'); }
+    catch (_) { continue; }
+    const meta = parseFeedMeta(src, name);
+    const probe = probeUserFeed(p, name);
+    if (!probe.ok) {
+      out.push({ name, path: p, meta, compat: probe });
+      continue;
+    }
+    const declaredApi = pluginApiVersion(meta);
+    const compat = declaredApi > FEED_API_VERSION
+      ? { ok: false, reason: 'api', declaredApi, runtimeApi: FEED_API_VERSION }
+      : { ok: true };
+    out.push({ name, path: p, meta, compat });
+  }
+  return out.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+// Loadable plugins only — the filter wrapper existing callers (wizard
+// multiselect, built-in-override detection, --new-feed collision check)
+// expect. Keeping the two functions distinct means "scan" everywhere
+// implicitly means "only things we can actually run" except in the one
+// place that explicitly needs to see rejects.
+function scanUserFeeds(userFeedsDir) {
+  return scanAllUserFeeds(userFeedsDir).filter(f => f.compat.ok);
+}
+
+// Parse a FEED_META_<name>='k=v\nk=v' block out of a plugin file into a flat
+// object. Matches the line-oriented parser in statusline.sh's debug branch
+// so the metadata shown by --list-feeds -v can't drift from what
+// NEWSLINE_DEBUG=1 reports. Unknown keys are preserved; the first `=` is the
+// separator (values can contain `=`). Only the `description`/`version`/
+// `author`/`homepage` keys have rendering hooks elsewhere — the rest are
+// just surfaced verbatim.
+function parseFeedMeta(src, feedName) {
+  const re = new RegExp(`^FEED_META_${feedName}\\s*=\\s*'([^']*)'`, 'm');
+  const m = src.match(re);
+  if (!m) return {};
+  const out = {};
+  for (const line of m[1].split('\n')) {
+    const eq = line.indexOf('=');
+    if (eq < 0) continue;
+    const k = line.slice(0, eq);
+    const v = line.slice(eq + 1);
+    if (k) out[k] = v;
+  }
+  return out;
+}
+
+// Template stamped by --new-feed. Keeping this adjacent to USER_FEEDS_README
+// so the template and the doc stay in visual lockstep — a user who reads the
+// README will recognize the scaffolded file exactly. The leading `# <name>.sh`
+// header mirrors the README's minimal-feed example.
+function newFeedTemplate(name) {
+  return `# ${name}.sh — a claude-newsline feed plugin.
+# https://github.com/sitapix/claude-newsline#custom-feeds
+#
+# The function name MUST be feed_${name} to match this file's name.
+# It sets three globals the dispatch loop reads back: LABEL, URL, JQ.
+#
+# Optional metadata block — shown by \`claude-newsline --list-feeds -v\`
+# and \`NEWSLINE_DEBUG=1\`. \`source=\` is auto-attached at load time.
+#   api       — plugin-contract version (current: ${FEED_API_VERSION}). Absent = 1.
+#               The runtime skips plugins declaring api > the version it
+#               supports, so keep this set to the version you tested on.
+#   category  — free-form label used to group feeds in --list-feeds -v.
+FEED_META_${name}='description=TODO: one-line description
+api=${FEED_API_VERSION}
+category=Custom
+version=0.1.0
+author=TODO'
+
+feed_${name}() {
+  LABEL='TODO'
+  URL='https://example.com/feed.json'
+  # jq emits three tab-separated fields: <label>\\t<title>\\t<url>.
+  # $default is LABEL above — use it, or promote a title-based label.
+  # URL must be http(s); other schemes render but drop the OSC 8 link.
+  # shellcheck disable=SC2016
+  JQ='.items[] | [$default, .title, .url] | @tsv'
+}
+
+# Uncomment for a parameterized feed — feed_${name} is called once per
+# comma-separated entry in $NEWSLINE_${name.toUpperCase()}_SRCS, with the entry
+# as $1. Remember to re-validate $1 inside the function (defense against a
+# hand-edited .env injecting into URLs), and return 1 to skip a bad entry.
+#
+# ${name.toUpperCase()}_SRCS="\${NEWSLINE_${name.toUpperCase()}_SRCS:-default-entry}"
+# FEED_PARAMS_${name}='${name.toUpperCase()}_SRCS'
+
+# Test:   claude-newsline --test-feed ${name}
+# Offline: claude-newsline --test-feed ${name} --fixture sample.json
+`;
 }
 
 // Matches our appended/standalone segment. We deliberately require:
@@ -349,9 +529,13 @@ function parseArgs(argv) {
     redditSubs: null,
     rotation: null,
     motion: null,
+    testFeed: null,
+    fixture: null,
+    newFeed: null,
     uninstall: false,
     yes: false,
     listFeeds: false,
+    listFeedsVerbose: false,
     help: false,
     error: null,
   };
@@ -364,6 +548,9 @@ function parseArgs(argv) {
     '--reddit-subs': 'redditSubs',
     '--rotation':    'rotation',
     '--motion':      'motion',
+    '--test-feed':   'testFeed',
+    '--fixture':     'fixture',
+    '--new-feed':    'newFeed',
   };
   const SWITCHES = {
     '--no-labels':       o => { o.showLabels = false; },
@@ -373,6 +560,11 @@ function parseArgs(argv) {
     '-y':                o => { o.yes = true; },
     '--non-interactive': o => { o.yes = true; },
     '--list-feeds':      o => { o.listFeeds = true; },
+    // -v pairs with --list-feeds to print metadata (description/author/homepage)
+    // — a minimal subset of what --debug would show. Orthogonal to --help/-h so
+    // bare `-v` on its own is a no-op (there's no "verbose install").
+    '-v':                o => { o.listFeedsVerbose = true; },
+    '--verbose':         o => { o.listFeedsVerbose = true; },
     '--help':            o => { o.help = true; },
     '-h':                o => { o.help = true; },
   };
@@ -456,9 +648,22 @@ Options:
                      Capped at ${MAX_REDDIT_SUBS}; each entry is one HTTP request per refresh.
                      Reddit rate-limits anonymous JSON requests. A 429 skips
                      that tick and the last good headline keeps showing.
+  --test-feed <name> Run one fetch cycle for a single feed and print
+                     diagnostics (URL, HTTP code, jq row count, sample
+                     rows, URL-scheme warning). Works on built-ins and
+                     user feeds in ~/.claude/claude-newsline/feeds/.
+                     For parameterized feeds (e.g. reddit), iterates each
+                     CSV entry. Exits 0 on success, non-zero on failure.
+  --fixture <path>   Use with --test-feed to skip the network and pipe
+                     a saved JSON file into your jq filter instead. Lets
+                     you iterate on a feed's jq offline.
+  --new-feed <name>  Scaffold a starter feed_<name> plugin in your user
+                     feeds directory (~/.claude/claude-newsline/feeds/)
+                     and exit. Refuses to overwrite an existing file.
   --uninstall        Remove claude-newsline from settings.json
   --yes, -y          Skip confirmation prompt (required on non-TTY stdin)
-  --list-feeds       List available feeds and exit
+  --list-feeds       List available feeds (built-in + user) and exit
+                     Pair with -v / --verbose for per-feed metadata.
   --help, -h         Show this help
 
 Running with no flags on an interactive terminal opens a setup wizard.
@@ -757,11 +962,15 @@ function buildEnvUpdates(opts) {
 // currentEnv lookups at the prompt site, this collapses "missing" / "empty"
 // / "unknown option" into a single fallback path so the wizard never hands
 // clack an initialValue that isn't in its option list (which would render
-// as no-highlight and confuse the user).
-function wizardInitialValues(currentEnv, rotationOptions, separatorOptions) {
+// as no-highlight and confuse the user). `availableFeeds` is the union of
+// built-ins and user-plugin names the wizard will render as checkboxes —
+// defaults to ALL_FEEDS for callers (and tests) that don't need to see
+// user feeds.
+function wizardInitialValues(currentEnv, rotationOptions, separatorOptions, availableFeeds) {
   const env = currentEnv || {};
+  const feeds = availableFeeds && availableFeeds.length ? availableFeeds : ALL_FEEDS;
   const disabled = new Set(parseCsv(env.NEWSLINE_FEEDS_DISABLED || ''));
-  const initialFeeds = ALL_FEEDS.filter(f => !disabled.has(f));
+  const initialFeeds = feeds.filter(f => !disabled.has(f));
   const rotationN = Number(env.NEWSLINE_ROTATION_SEC);
   const rotationKnown = Number.isFinite(rotationN) && rotationOptions.includes(rotationN);
   // Infer motion from the two underlying env keys. NEWSLINE_SCROLL=0 (any
@@ -781,7 +990,7 @@ function wizardInitialValues(currentEnv, rotationOptions, separatorOptions) {
     }
   }
   return {
-    feeds: initialFeeds.length ? initialFeeds : ALL_FEEDS,
+    feeds: initialFeeds.length ? initialFeeds : feeds,
     redditSubs: env.NEWSLINE_REDDIT_SUBS || DEFAULT_REDDIT_SUB,
     color: NAMED_COLORS.includes(env.NEWSLINE_COLOR_FEED) ? env.NEWSLINE_COLOR_FEED : 'amber',
     showLabels: env.NEWSLINE_SHOW_LABELS !== '0',
@@ -791,29 +1000,29 @@ function wizardInitialValues(currentEnv, rotationOptions, separatorOptions) {
   };
 }
 
-// First-run interactive wizard. Mutates `opts` in place and returns true if
-// it ran — caller uses the return to skip the trailing confirm() since the
-// wizard itself is the confirmation. Dynamic import because @clack/prompts
-// is ESM-only; --help / --yes / non-TTY paths never reach here.
-// `currentEnv` is the existing settings.env so a re-run pre-fills answers.
+// First-run interactive wizard. Mutates `opts` in place and returns
+// `{ ran, clack }` — `ran: true` lets the caller skip the trailing
+// confirm() (the wizard IS the confirmation), and `clack` is the loaded
+// module so install()/describePlan()/applyPlan() can reuse the same UI
+// (log.*, outro) without re-importing. Dynamic import because
+// @clack/prompts is ESM-only; --help / --yes / non-TTY paths never reach
+// here. `currentEnv` is the existing settings.env so a re-run pre-fills
+// answers. Cancel exits 0 (user-initiated, not an error — matches clack's
+// own documented pattern). The import is try/wrapped because source
+// checkouts (`git clone && node bin/claude-newsline.js`) haven't run `npm
+// install`; rather than crash with a stack trace, fall back to flag-driven
+// install with a one-line hint. npx / global installs always resolve the
+// dep, so this path is only hit in dev.
 async function runWizard(opts, currentEnv = {}) {
   let clack;
   try {
     clack = await import('@clack/prompts');
   } catch (_) {
     console.error('Warning: @clack/prompts not available; skipping wizard.');
-    console.error('Re-run with explicit flags (--disable / --color / --separator / --no-labels) or install deps.');
-    return false;
+    console.error('Re-run with explicit flags (--disable / --color / --separator / --no-labels) or `npm install` to restore the wizard.');
+    return { ran: false, clack: null };
   }
-  const { intro, outro, multiselect, select, text, note, cancel, isCancel } = clack;
-
-  const bail = (result) => {
-    if (isCancel(result)) {
-      cancel('Aborted.');
-      process.exit(1);
-    }
-    return result;
-  };
+  const { intro, multiselect, select, text, note, cancel, group, log } = clack;
 
   const SAMPLE_TITLE = 'New Rust release lands async closures';
   // Custom rotation values the user may have hand-edited survive a reconfigure
@@ -827,73 +1036,45 @@ async function runWizard(opts, currentEnv = {}) {
     ? [...BASE_ROTATION_OPTIONS, envRotation].sort((a, b) => a - b)
     : BASE_ROTATION_OPTIONS;
   const SEPARATOR_OPTIONS = [' \u2022 ', ' \u203a ', ' \u00b7 ', ' \u2014 '];
-  const initial = wizardInitialValues(currentEnv, ROTATION_OPTIONS, SEPARATOR_OPTIONS);
+
+  // User plugins dropped into the feeds dir appear in the wizard checkbox
+  // alongside built-ins. scanUserFeeds() silently skips files whose names
+  // would fail the sh-side loader — what shows up here is exactly what
+  // load_user_feeds would also accept. Reads metadata lazily (only when we
+  // need it for the hint), so a large feeds dir doesn't slow the wizard.
+  const paths = installPaths();
+  const userFeedEntries = scanUserFeeds(paths.userFeedsDir);
+  // A user feed with the same name as a built-in overrides at load time —
+  // the rotation slot stays singular (load_user_feeds dedupes ALL_FEEDS),
+  // so the checkbox should do the same. User version wins visually.
+  const builtinNames = new Set(ALL_FEEDS);
+  const overridingUserNames = new Set(
+    userFeedEntries.filter(f => builtinNames.has(f.name)).map(f => f.name)
+  );
+  const availableFeedNames = [
+    ...ALL_FEEDS,
+    ...userFeedEntries.filter(f => !builtinNames.has(f.name)).map(f => f.name),
+  ];
+  const initial = wizardInitialValues(currentEnv, ROTATION_OPTIONS, SEPARATOR_OPTIONS, availableFeedNames);
   // A "fresh" install (no prior config) gets a one-line explainer. Reconfigures
   // skip it — the returning user already knows what the tool is.
   const isFreshInstall = !currentEnv || Object.keys(currentEnv).length === 0;
 
-  intro('\x1b[1mclaude-newsline setup\x1b[0m');
+  // Reuse the runtime's prefix glyph (Ξ) and accent palette so the wizard
+  // header visually ties to the installed headline. `amber` is the default
+  // feed color in PALETTE — bold keeps the tag readable on dark backgrounds
+  // where depth-reduced palette entries wash out.
+  intro(colorize('\u039e claude-newsline', 'amber') + colorize(' setup', 'dim'));
   if (isFreshInstall) {
     note(
       'Rotating news headlines in your Claude Code status line.\n' +
       'Cmd/Ctrl-click a headline to open the story.',
       'What this does',
     );
-  }
-
-  const feeds = bail(await multiselect({
-    message: 'Which feeds should rotate?',
-    required: true,
-    initialValues: initial.feeds,
-    options: [
-      { label: 'Hacker News', value: 'hn',       hint: 'front page top 30' },
-      { label: 'Reddit',      value: 'reddit',   hint: `pick subreddits next — max ${MAX_REDDIT_SUBS}` },
-      { label: 'Lobsters',    value: 'lobsters', hint: 'hottest links (programming & security)' },
-    ],
-  }));
-
-  // Subreddit input only shown when Reddit is enabled. Validation mirrors
-  // the CLI flag (format + count cap) so the user sees the same errors
-  // here rather than hitting them post-wizard in install().
-  let redditSubs = null;
-  if (feeds.includes('reddit')) {
-    // Skip the formats lesson for returning users who already have valid
-    // subs configured — they've seen it before and it's noise on a
-    // reconfigure. Only fresh installs (or installs with invalid subs) get
-    // the teaching block.
-    const existingSubs = currentEnv && currentEnv.NEWSLINE_REDDIT_SUBS;
-    const existingValid = existingSubs &&
-      parseCsv(existingSubs).every(isValidRedditEntry);
-    if (!existingValid) {
-      note(
-        'single sub      programming\n' +
-        'combined feed   rust+golang+linux\n' +
-        'user multi      mawburn/techsubs\n' +
-        '\n' +
-        'Reddit rate-limits anonymous requests; a 429 just\n' +
-        'skips that tick and the last good headline keeps showing.',
-        'Subreddit formats',
-      );
-    }
-    const raw = bail(await text({
-      message: `Subreddits (comma-separated, spaces ok, max ${MAX_REDDIT_SUBS}):`,
-      placeholder: 'programming, rust+golang, mawburn/techsubs',
-      initialValue: initial.redditSubs,
-      validate: (v) => {
-        const subs = parseCsv(v);
-        if (subs.length === 0) return 'Enter at least one entry';
-        if (subs.length > MAX_REDDIT_SUBS) {
-          return `Too many (${subs.length} > ${MAX_REDDIT_SUBS}) — each is one HTTP request per refresh`;
-        }
-        for (const s of subs) {
-          if (!isValidRedditEntry(s)) {
-            return `Invalid entry "${s}" — use "name", "sub1+sub2", or "user/multi"`;
-          }
-        }
-        return undefined;
-      },
-    }));
-    redditSubs = normalizeRedditSubs(raw);
+  } else {
+    // Reconfigure flow: returning user sees prefilled answers. One-line
+    // orientation beats a second `note()` — scan it once and move on.
+    log.info('Reconfiguring — press Enter to keep existing answers.');
   }
 
   // Palette entries are derived from PALETTE (i.e. from colors.sh) so adding
@@ -907,15 +1088,6 @@ async function runWizard(opts, currentEnv = {}) {
     ['Dim (faded)', 'dim'],
     ['No color',    'none'],
   ];
-  const color = bail(await select({
-    message: 'Headline accent color?',
-    initialValue: initial.color,
-    options: colorChoices.map(([label, value]) => ({
-      label,
-      value,
-      hint: colorize(`HN \u2022 ${SAMPLE_TITLE}`, value),
-    })),
-  }));
 
   // One combined step for "what does each headline look like?" — the prior
   // two-step flow (show-label? then separator?) made the user answer a config
@@ -933,19 +1105,6 @@ async function runWizard(opts, currentEnv = {}) {
     { label: `HN \u2014 Title`, value: ' \u2014 ' },
   ];
   const initialFormat = initial.showLabels ? initial.separator : '__bare__';
-  const headlineFormat = bail(await select({
-    message: 'Headline format?',
-    initialValue: initialFormat,
-    options: HEADLINE_FORMAT_OPTIONS.map(({ label, value }) => ({
-      label,
-      value,
-      hint: value === '__bare__'
-        ? colorize(SAMPLE_TITLE, color)
-        : colorize(`HN${value}${SAMPLE_TITLE}`, color),
-    })),
-  }));
-  const showLabels = headlineFormat !== '__bare__';
-  const separator = showLabels ? headlineFormat : null;
 
   // Concrete rates instead of vibes ("chill" / "balanced" told the user
   // nothing they couldn't read off the seconds number). Rounded frequencies
@@ -957,79 +1116,198 @@ async function runWizard(opts, currentEnv = {}) {
     }
     return `~${Math.round(60 / sec)} headlines / minute`;
   };
-  const rotation = bail(await select({
-    message: 'How long should each headline stay on screen?',
-    initialValue: initial.rotation,
-    // Drop "(default)" markers — clack's initialValue highlight already
-    // signals the pre-selected option. Hand-edited values that aren't in
-    // BASE_ROTATION_OPTIONS get injected upstream so Enter-through preserves them.
-    options: ROTATION_OPTIONS.map((sec) => ({
-      label: `${sec}s`.padEnd(5),
-      value: sec,
-      hint: perMin(sec),
-    })),
-  }));
 
-  // Motion preview hints. At 1 FPS (Claude Code's refresh floor) the scroll
-  // is a stepped slide — we can't animate inside a hint, so each scroll
-  // option shows TWO frame slices joined by `→` to imply motion. Slide and
-  // quick differ by stride: quick's two frames span further apart on the
-  // tape, so the arrow visibly bridges more distance — a visual proxy for
-  // "fewer frames in the same total motion."
-  const labelForSample = showLabels ? `HN${separator}` : '';
-  const SAMPLE_A = `${labelForSample}${SAMPLE_TITLE}`;
-  const SAMPLE_B = `${showLabels ? `Lobsters${separator}` : ''}Postgres 18 adds lateral joins`;
-  const SAMPLE_SEP = '  |  ';
-  const tape = SAMPLE_A + SAMPLE_SEP + SAMPLE_B;
-  const SLIDE_WIDTH = 26;
-  const sliceTape = (offset) => tape.slice(offset, offset + SLIDE_WIDTH);
-  // Slide: two frames near the middle of the transition (smaller stride).
-  // Quick: two frames bracketing more of the tape (larger stride → reads as
-  // "bigger jump per frame"). The numbers below are visual estimates tuned
-  // to the 26-char window; they don't need to correspond to actual tick counts.
-  const mid = SAMPLE_A.length;
-  const slideFrameA = sliceTape(Math.max(0, mid - SLIDE_WIDTH + 6));
-  const slideFrameB = sliceTape(Math.max(0, mid - 6));
-  const quickFrameA = sliceTape(Math.max(0, mid - SLIDE_WIDTH + 12));
-  const quickFrameB = sliceTape(Math.max(0, mid + 2));
-  const slideDemo = `${slideFrameA} \u2192 ${slideFrameB}`;
-  const quickDemo = `${quickFrameA} \u2192 ${quickFrameB}`;
+  // Build motion preview frames. Inlined so the motion step can reuse the
+  // SAMPLE_A/tape values (final preview below rebuilds from final answers).
+  // At 1 FPS (Claude Code's refresh floor) the scroll is a stepped slide —
+  // we can't animate inside a hint, so each scroll option shows TWO frame
+  // slices joined by `→` to imply motion. Slide and quick differ by stride:
+  // quick's two frames span further apart on the tape, so the arrow visibly
+  // bridges more distance — a visual proxy for "fewer frames in the same
+  // total motion."
+  const buildMotionDemo = (showLabels, separator) => {
+    const labelForSample = showLabels ? `HN${separator}` : '';
+    const SAMPLE_A = `${labelForSample}${SAMPLE_TITLE}`;
+    const SAMPLE_B = `${showLabels ? `Lobsters${separator}` : ''}Postgres 18 adds lateral joins`;
+    const SAMPLE_SEP = '  |  ';
+    const tape = SAMPLE_A + SAMPLE_SEP + SAMPLE_B;
+    const SLIDE_WIDTH = 26;
+    const sliceTape = (offset) => tape.slice(offset, offset + SLIDE_WIDTH);
+    const mid = SAMPLE_A.length;
+    const slideFrameA = sliceTape(Math.max(0, mid - SLIDE_WIDTH + 6));
+    const slideFrameB = sliceTape(Math.max(0, mid - 6));
+    const quickFrameA = sliceTape(Math.max(0, mid - SLIDE_WIDTH + 12));
+    const quickFrameB = sliceTape(Math.max(0, mid + 2));
+    return {
+      SAMPLE_A,
+      slideFrameB,
+      quickFrameB,
+      slideDemo: `${slideFrameA} \u2192 ${slideFrameB}`,
+      quickDemo: `${quickFrameA} \u2192 ${quickFrameB}`,
+    };
+  };
 
-  // The 1 FPS caveat is load-bearing context (explains why "smooth" isn't
-  // a preset) but drags the select message out. Surface it as a short note
-  // before the prompt instead — readers scan it once and move on.
-  note(
-    'Claude Code refreshes at 1 FPS, so the scroll is a stepped slide.\n' +
-    'The preset picks how many 1s ticks the slide takes.',
-    'About motion',
+  // group() runs the prompts sequentially, passes prior answers via
+  // { results }, and centralizes cancel handling in onCancel — replacing
+  // the hand-rolled bail() wrapper on every prompt.
+  const answers = await group(
+    {
+      feeds: () => multiselect({
+        message: 'Which feeds should rotate?',
+        required: true,
+        initialValues: initial.feeds,
+        options: (() => {
+          const builtinOpts = [
+            { label: 'Hacker News', value: 'hn',       hint: overridingUserNames.has('hn')       ? 'overridden by your user feed' : 'front page top 30' },
+            { label: 'Reddit',      value: 'reddit',   hint: overridingUserNames.has('reddit')   ? 'overridden by your user feed' : `pick subreddits next — max ${MAX_REDDIT_SUBS}` },
+            { label: 'Lobsters',    value: 'lobsters', hint: overridingUserNames.has('lobsters') ? 'overridden by your user feed' : 'hottest links (programming & security)' },
+          ].filter(o => ALL_FEEDS.includes(o.value));
+          // User-plugin rows use the FEED_META `description` when present
+          // (matches --list-feeds semantics) and fall back to a generic
+          // "user feed" tag — the source path is too long for the hint
+          // column and already visible via --list-feeds.
+          const userOpts = userFeedEntries
+            .filter(f => !builtinNames.has(f.name))
+            .map(f => ({
+              label: f.name,
+              value: f.name,
+              hint: (f.meta && f.meta.description) || 'user feed',
+            }));
+          return [...builtinOpts, ...userOpts];
+        })(),
+      }),
+
+      // Conditional prompt: non-prompt return values are fine with group().
+      // When Reddit isn't selected we short-circuit to `null`; downstream
+      // code treats null as "leave REDDIT_SUBS alone". Validation mirrors
+      // the CLI flag (format + count cap) so the user sees the same errors
+      // here rather than hitting them post-wizard in install().
+      redditSubs: ({ results }) => {
+        if (!results.feeds.includes('reddit')) return null;
+        // Skip the formats lesson for returning users who already have
+        // valid subs — they've seen it before and it's noise on a
+        // reconfigure. Only fresh installs (or invalid subs) get it.
+        const existingSubs = currentEnv && currentEnv.NEWSLINE_REDDIT_SUBS;
+        const existingValid = existingSubs &&
+          parseCsv(existingSubs).every(isValidRedditEntry);
+        if (!existingValid) {
+          note(
+            'single sub      programming\n' +
+            'combined feed   rust+golang+linux\n' +
+            'user multi      mawburn/techsubs\n' +
+            '\n' +
+            'Reddit rate-limits anonymous requests; a 429 just\n' +
+            'skips that tick and the last good headline keeps showing.',
+            'Subreddit formats',
+          );
+        }
+        return text({
+          message: `Subreddits (comma-separated, spaces ok, max ${MAX_REDDIT_SUBS}):`,
+          placeholder: 'programming, rust+golang, mawburn/techsubs',
+          initialValue: initial.redditSubs,
+          validate: (v) => {
+            const subs = parseCsv(v);
+            if (subs.length === 0) return 'Enter at least one entry';
+            if (subs.length > MAX_REDDIT_SUBS) {
+              return `Too many (${subs.length} > ${MAX_REDDIT_SUBS}) — each is one HTTP request per refresh`;
+            }
+            for (const s of subs) {
+              if (!isValidRedditEntry(s)) {
+                return `Invalid entry "${s}" — use "name", "sub1+sub2", or "user/multi"`;
+              }
+            }
+            return undefined;
+          },
+        });
+      },
+
+      color: () => select({
+        message: 'Headline accent color?',
+        initialValue: initial.color,
+        options: colorChoices.map(([label, value]) => ({
+          label,
+          value,
+          hint: colorize(`HN \u2022 ${SAMPLE_TITLE}`, value),
+        })),
+      }),
+
+      headlineFormat: ({ results }) => select({
+        message: 'Headline format?',
+        initialValue: initialFormat,
+        options: HEADLINE_FORMAT_OPTIONS.map(({ label, value }) => ({
+          label,
+          value,
+          hint: value === '__bare__'
+            ? colorize(SAMPLE_TITLE, results.color)
+            : colorize(`HN${value}${SAMPLE_TITLE}`, results.color),
+        })),
+      }),
+
+      // Drop "(default)" markers — clack's initialValue highlight already
+      // signals the pre-selected option. Hand-edited values that aren't in
+      // BASE_ROTATION_OPTIONS get injected upstream so Enter-through preserves them.
+      rotation: () => select({
+        message: 'How long should each headline stay on screen?',
+        initialValue: initial.rotation,
+        options: ROTATION_OPTIONS.map((sec) => ({
+          label: `${sec}s`.padEnd(5),
+          value: sec,
+          hint: perMin(sec),
+        })),
+      }),
+
+      // The hint for each option renders the motion visually (two frame
+      // slices joined by an arrow) — that's the preview. We dropped the
+      // prior `note('About motion', …)` explainer because it restated in
+      // prose what the hints already showed; two notes in one group made
+      // the UI feel noisy. The 1 FPS caveat now lives in the option labels
+      // ("frames") and --help.
+      motion: ({ results }) => {
+        const showLabels = results.headlineFormat !== '__bare__';
+        const separator = showLabels ? results.headlineFormat : null;
+        const demo = buildMotionDemo(showLabels, separator);
+        return select({
+          message: 'How should headlines transition?',
+          initialValue: initial.motion,
+          options: [
+            {
+              label: 'Static \u2014 no animation',
+              value: 'static',
+              hint: colorize(demo.SAMPLE_A, results.color),
+            },
+            {
+              label: `Slide  \u2014 ${DEFAULT_SCROLL_SEC} frames`,
+              value: 'slide',
+              hint: colorize(demo.slideDemo, results.color),
+            },
+            {
+              label: `Quick  \u2014 ${QUICK_SCROLL_SEC} frames (snappier)`,
+              value: 'quick',
+              hint: colorize(demo.quickDemo, results.color),
+            },
+          ],
+        });
+      },
+    },
+    {
+      onCancel() {
+        cancel('Aborted.');
+        process.exit(0);
+      },
+    }
   );
-  const motion = bail(await select({
-    message: 'How should headlines transition?',
-    initialValue: initial.motion,
-    options: [
-      {
-        label: 'Static \u2014 no animation',
-        value: 'static',
-        hint: colorize(SAMPLE_A, color),
-      },
-      {
-        label: `Slide  \u2014 ${DEFAULT_SCROLL_SEC} frames`,
-        value: 'slide',
-        hint: colorize(slideDemo, color),
-      },
-      {
-        label: `Quick  \u2014 ${QUICK_SCROLL_SEC} frames (snappier)`,
-        value: 'quick',
-        hint: colorize(quickDemo, color),
-      },
-    ],
-  }));
+
+  const { feeds, color, headlineFormat, rotation, motion } = answers;
+  const redditSubs = answers.redditSubs ? normalizeRedditSubs(answers.redditSubs) : null;
+  const showLabels = headlineFormat !== '__bare__';
+  const separator = showLabels ? headlineFormat : null;
 
   // Final preview. The product IS rotation + transition, so show it: render
   // the starting headline, optionally a mid-transition frame for scroll
   // motions, and the next headline labeled with when it arrives. The prefix
   // glyph renders dim (matches runtime NEWSLINE_COLOR_PREFIX default); the
   // headline renders in the chosen color.
+  const demo = buildMotionDemo(showLabels, separator);
   const previewPrefix = colorize('\u039e ', 'dim');
   const headA = showLabels ? `HN${separator}${SAMPLE_TITLE}` : SAMPLE_TITLE;
   const headB = showLabels
@@ -1038,19 +1316,20 @@ async function runWizard(opts, currentEnv = {}) {
   const previewFrames = [];
   previewFrames.push(`${previewPrefix}${colorize(headA, color)}   ${colorize('now', 'dim')}`);
   if (motion !== 'static') {
-    const previewScrollFrame = (motion === 'quick' ? quickFrameB : slideFrameB);
+    const previewScrollFrame = (motion === 'quick' ? demo.quickFrameB : demo.slideFrameB);
     previewFrames.push(`${previewPrefix}${colorize(previewScrollFrame, color)}   ${colorize('sliding', 'dim')}`);
   }
   previewFrames.push(`${previewPrefix}${colorize(headB, color)}   ${colorize(`in ${rotation}s`, 'dim')}`);
   const transitionSummary = motion === 'static'
     ? `switches every ${rotation}s`
     : `${motion === 'quick' ? QUICK_SCROLL_SEC : DEFAULT_SCROLL_SEC}-frame slide every ${rotation}s`;
+  // Title doubles as the confirmation for the wizard path — there's no
+  // trailing "Proceed?" prompt after this, so the title must read as
+  // "this is what you're about to install", not just a passive preview.
   note(
     previewFrames.join('\n') + '\n\n' + transitionSummary,
-    'Preview',
+    'Ready to install',
   );
-
-  outro('Ready to install.');
 
   // Use opts.only (positive form) — buildEnvUpdates already inverts to
   // FEEDS_DISABLED. Avoids a double-negative where the wizard inverts once
@@ -1066,37 +1345,231 @@ async function runWizard(opts, currentEnv = {}) {
   opts.redditSubs = redditSubs;
   opts.rotation = rotation;
   opts.motion = motion;
-  return true;
+  // Defer outro() to install() so describePlan / applyPlan can render
+  // inside the same clack flow (log.step, log.success) and outro is the
+  // final visual — one continuous vertical-bar UI from intro to done.
+  return { ran: true, clack };
 }
 
-function confirm(question, defaultYes = true) {
-  return new Promise(resolve => {
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-    const hint = defaultYes ? '[Y/n]' : '[y/N]';
-    rl.question(`${question} ${hint} `, ans => {
-      rl.close();
-      const a = ans.trim().toLowerCase();
-      if (a === '') return resolve(defaultYes);
-      resolve(a.startsWith('y'));
-    });
+// Proceed confirmation for interactive installs. Flag-driven paths (no wizard)
+// always pass `clack=null` and lazy-load the module here. The wizard path passes
+// its already-loaded module so the confirm lands inside the same vertical-bar UI
+// instead of starting a fresh intro/outro block. `--yes` paths bypass this
+// entirely. isCancel → exit 0 matches clack's documented Ctrl-C pattern
+// (user-initiated, not an error). A missing @clack/prompts (source-checkout
+// without `npm install`) degrades to "re-run with --yes" — same graceful
+// fallback as runWizard.
+async function confirmProceed(clack) {
+  if (!clack) {
+    try {
+      clack = await import('@clack/prompts');
+    } catch (_) {
+      console.error('\nError: @clack/prompts not available; cannot prompt for confirmation.');
+      console.error('Re-run with --yes (or -y) to skip the prompt, or `npm install` to restore it.');
+      return false;
+    }
+  }
+  const result = await clack.confirm({
+    message: 'Apply these changes?',
+    active: 'Install',
+    inactive: 'Cancel',
+    initialValue: true,
   });
+  if (clack.isCancel(result)) {
+    clack.cancel('Aborted.');
+    process.exit(0);
+  }
+  return result;
 }
 
 // All filesystem paths install/uninstall touch. One place so the two
 // functions can't disagree about "where does claude-newsline live".
 function installPaths() {
   const cfgDir = configDir();
+  const cacheFile = path.join(cfgDir, 'cache', 'feed-titles.txt');
+  // User-feeds directory — statusline.sh defaults to this path via
+  // ${NEWSLINE_FEEDS_DIR:-$CONFIG_DIR/claude-newsline/feeds}. Both sides
+  // must agree; the default is canonical here so tests that stub the
+  // installer path also exercise the runtime default.
+  const userFeedsDir = path.join(cfgDir, 'claude-newsline', 'feeds');
   return {
     cfgDir,
-    settingsPath: path.join(cfgDir, 'settings.json'),
-    scriptDest:   path.join(cfgDir, 'claude-newsline.sh'),
-    colorsDest:   path.join(cfgDir, 'colors.sh'),
-    scriptSrc:    path.join(__dirname, 'statusline.sh'),
-    colorsSrc:    path.join(__dirname, 'colors.sh'),
-    cacheDir:     path.join(cfgDir, 'cache'),
-    cacheFile:    path.join(cfgDir, 'cache', 'feed-titles.txt'),
+    settingsPath:     path.join(cfgDir, 'settings.json'),
+    scriptDest:       path.join(cfgDir, 'claude-newsline.sh'),
+    colorsDest:       path.join(cfgDir, 'colors.sh'),
+    // Filename identical on src and dest so statusline.sh's
+    // `$_SCRIPT_DIR/xml-to-json.js` resolves the same way at dev (repo/bin/)
+    // and installed ($CLAUDE_CONFIG_DIR/).
+    xmlToJsonDest:    path.join(cfgDir, 'xml-to-json.js'),
+    scriptSrc:        path.join(__dirname, 'statusline.sh'),
+    colorsSrc:        path.join(__dirname, 'colors.sh'),
+    xmlToJsonSrc:     path.join(__dirname, 'xml-to-json.js'),
+    cacheDir:         path.join(cfgDir, 'cache'),
+    cacheFile,
+    userFeedsDir,
+    userFeedsReadme:  path.join(userFeedsDir, 'README.md'),
+    // .pending is the double-buffer slot; .lock is the refresh serialization
+    // dir. Both are part of the runtime contract with statusline.sh — if the
+    // suffixes drift, uninstall leaves orphans and re-install thinks a
+    // refresh is in flight.
+    cachePendingFile: `${cacheFile}.pending`,
+    cacheLockDir:     `${cacheFile}.lock`,
   };
 }
+
+// README template dropped into paths.userFeedsReadme on first install.
+// Never overwrites an existing file (see wx-flag write in applyPlan) so a
+// user-edited README survives re-runs.
+const USER_FEEDS_README = `# Custom feeds
+
+Drop a \`<name>.sh\` file in this directory and it becomes a feed in your
+claude-newsline rotation. Filename maps to function name:
+\`nyt.sh\` defines \`feed_nyt()\`.
+
+Fastest start — scaffold a template and test it offline:
+
+\`\`\`sh
+claude-newsline --new-feed nyt
+# edit ~/.claude/claude-newsline/feeds/nyt.sh
+claude-newsline --test-feed nyt --fixture sample.json
+\`\`\`
+
+## Share or browse community feeds
+
+No central registry — but the project's GitHub Discussions are the place
+to share a plugin you've written or grab one someone else has posted:
+
+  https://github.com/sitapix/claude-newsline/discussions
+
+Treat third-party plugins the same way you'd treat any shell script from
+the internet — read the file before dropping it in this directory.
+
+## The plugin contract
+
+A feed plugin is one POSIX-sh file that defines:
+
+1. **Required** \`feed_<name>()\` — a function setting three globals the
+   dispatch loop reads back: \`LABEL\`, \`URL\`, \`JQ\`.
+2. **Optional** \`FEED_PARAMS_<name>\` — the internal variable name your feed
+   will be called for each CSV entry of (see "Parameterized feed" below).
+3. **Optional** \`FEED_META_<name>\` — newline-separated \`key=value\` lines
+   shown in \`NEWSLINE_DEBUG=1\` and \`--list-feeds -v\`. Recognized keys:
+   - \`api\` — plugin-contract version (current: ${FEED_API_VERSION}). Declares which
+     version of the plugin contract this file was written against. Plugins
+     declaring a version newer than the runtime supports are skipped.
+     Absent or non-numeric is treated as \`api=1\` (backward compat).
+   - \`category\` — free-form group label used by \`--list-feeds -v\` to
+     cluster related plugins. Defaults to \`Custom\` when absent.
+   - \`description\`, \`version\`, \`author\`, \`homepage\` — informational only.
+   - \`source\` — auto-attached at load time with the plugin's file path.
+
+Filename rules (enforced at load time):
+
+- Must match \`[A-Za-z_][A-Za-z0-9_]*\` before the \`.sh\` — POSIX shell
+  function-name rules. \`2fa.sh\` (leading digit) and \`my-feed.sh\`
+  (hyphen) are rejected.
+- A file named the same as a built-in (e.g. \`hn.sh\`) OVERRIDES the
+  built-in for this installation. No duplicate rotation slot — it simply
+  takes over.
+
+## Security
+
+**User plugins are sourced into the statusline.sh shell process.** A
+malicious file dropped here has the same privileges as your status line
+runs with. Only install plugins you've read. \`NEWSLINE_DEBUG=1\` prints
+the full path of every loaded plugin so you can audit at any time.
+
+## Minimal feed
+
+\`\`\`sh
+# nyt.sh
+FEED_META_nyt='description=New York Times top stories
+api=${FEED_API_VERSION}
+category=News
+version=0.1.0
+author=you'
+feed_nyt() {
+  LABEL='NYT'
+  URL='https://example.com/nyt-feed.json'
+  # jq emits three tab-separated fields: <label>\\t<title>\\t<url>
+  # \$default is the LABEL above — use it, or promote a title-based label.
+  JQ='.articles[] | [\$default, .title, .url] | @tsv'
+}
+\`\`\`
+
+Restart Claude Code (or let the current cache expire) and the new feed
+joins the rotation.
+
+## Parameterized feed
+
+Same shape as the built-in Reddit feed — declare \`FEED_PARAMS_<name>\` to
+split a CSV env var and call your feed once per entry:
+
+\`\`\`sh
+# jira.sh
+FEED_META_jira='description=JIRA project issues (parameterized)'
+feed_jira() {
+  _project=\$1
+  case "\$_project" in ''|*[!A-Za-z0-9_-]*) return 1 ;; esac
+  LABEL="JIRA/\$_project"
+  URL="https://company.atlassian.net/rest/api/2/search?jql=project=\$_project"
+  JQ='.issues[] | [\$default, .fields.summary, "https://company.atlassian.net/browse/\\(.key)"] | @tsv'
+}
+# Bind the user-facing env var (NEWSLINE_*) to the internal name FEED_PARAMS
+# points at. The dispatch loop reads $JIRA_PROJECTS, not $NEWSLINE_JIRA_PROJECTS —
+# without this line, nothing in your settings.json "env" reaches the feed.
+JIRA_PROJECTS="\${NEWSLINE_JIRA_PROJECTS:-}"
+FEED_PARAMS_jira='JIRA_PROJECTS'
+# Then set NEWSLINE_JIRA_PROJECTS=ENG,INFRA via Claude Code settings.json "env".
+\`\`\`
+
+Contract for parameterized feeds:
+- The function is called once per comma-separated entry in the resolved
+  internal variable. \`$1\` is the entry.
+- \`return 1\` rejects a single entry (it's skipped; other entries proceed).
+  This is the right response to an invalid entry — the runtime treats it
+  as belt-and-braces over any installer-side validation.
+- The function must re-validate its input — a hand-edited \`.env\` must
+  not be able to inject into URLs.
+- You MUST include a \`YOUR_INTERNAL="\${NEWSLINE_YOUR_INTERNAL:-default}"\`
+  line that binds the user-facing env var to the internal variable name
+  \`FEED_PARAMS_<name>\` points at. Built-ins do this in statusline.sh's
+  CONFIG block; user plugins declare it in the plugin file itself.
+
+## Output contract
+
+The jq filter must emit newline-separated records of three tab-separated
+fields:
+
+    <label>\\t<title>\\t<url>
+
+- \`<label>\` — shown as the \`SOURCE • \` prefix. Can be the default passed
+  in via \`--arg default "$LABEL"\`, or a per-item override (the built-in
+  HN feed promotes \`Show HN\`/\`Ask HN\`/\`Tell HN\` prefixes into the label
+  this way).
+- \`<title>\` — the headline text. UTF-8 ok; byte-truncated to MAX_TITLE.
+- \`<url>\` — **must be http(s)://**. Any other scheme drops the OSC 8
+  hyperlink on render (defense against terminal URL-handler argument
+  injection). The line still rotates into view, just unlinked.
+
+Control bytes (C0/C1, ESC, CR) in any field are stripped after jq emits
+them and before the cache is written. You can't accidentally break the
+terminal by emitting a title that contains an escape sequence.
+
+## Debugging
+
+\`NEWSLINE_DEBUG=1\` in your environment prints:
+
+- the resolved config,
+- the loaded-feeds map,
+- each feed's metadata block (description/version/author/source),
+- the path each user feed came from.
+
+A file with a syntax error or a missing \`feed_<name>\` function is
+skipped silently; the rest of the rotation keeps working.
+
+See https://github.com/sitapix/claude-newsline#custom-feeds for details.
+`;
 
 // Derive the intended install shape from an already-read settings object.
 // The `settings` ref is live — applyPlan() mutates it, so `plan` is a
@@ -1168,108 +1641,196 @@ function isSettingsNoop(plan) {
   return true;
 }
 
-function describePlan(plan) {
+// Abstracts "how do we render a status line of install output" so
+// describePlan/applyPlan can emit through clack's log.* (vertical-bar UI,
+// when the wizard ran) or plain console.log (flag-driven paths without
+// clack loaded). Same call sites, same output ordering — only the glyphs
+// differ. `clack` is the module returned by runWizard, or null.
+function createUILogger(clack) {
+  if (clack) {
+    return {
+      warn:    (s) => clack.log.warn(s),
+      step:    (s) => clack.log.step(s),
+      success: (s) => clack.log.success(s),
+      message: (s) => clack.log.message(s),
+      // Present only on the clack path so applyPlan can feature-detect and
+      // fall back to a flat sequential render when tasks() isn't available.
+      tasks:   (list) => clack.tasks(list),
+    };
+  }
+  return {
+    warn:    (s) => console.log(`\x1b[33m${s}\x1b[0m`),
+    step:    (s) => console.log(s),
+    success: (s) => console.log(`\u2713 ${s}`),
+    message: (s) => console.log(s),
+  };
+}
+
+function describePlan(plan, ui) {
+  ui = ui || createUILogger(null);
   // Fresh configs have no statusLine at all. Claude Code's built-in default
   // is minimal (no cwd/model/git/cost unless the user configured them), so
   // the user isn't "losing" a rich line — but they also aren't getting one.
   // Call this out so a first-time user knows they can combine the headline
   // with the richer statusLine examples in the Claude Code docs.
   if (!plan.existingCmd) {
-    console.log('');
-    console.log('\x1b[33m! No existing statusLine detected.\x1b[0m');
-    console.log('  After install, your status line will be only the rotating headline.');
-    console.log('  For model / cwd / git / cost info alongside it, set up a base statusLine');
-    console.log('  first (see https://code.claude.com/docs/en/statusline) and re-run —');
-    console.log('  this installer chains the headline after whatever is already there.');
-    console.log('');
+    ui.warn(
+      'No existing statusLine detected.\n' +
+      'After install, your status line will be only the rotating headline.\n' +
+      'For model / cwd / git / cost info alongside it, set up a base statusLine\n' +
+      'first (see https://code.claude.com/docs/en/statusline) and re-run —\n' +
+      'this installer chains the headline after whatever is already there.'
+    );
   }
   if (isSettingsNoop(plan)) {
-    console.log('Configuration already matches — no changes to settings.json.');
-    console.log('(Installed scripts will still be refreshed.)');
+    ui.message('Configuration already matches — no changes to settings.json.\n(Installed scripts will still be refreshed.)');
     return;
   }
-  console.log('Planned changes to settings.json:');
+  // Collect into a single block so clack's log.step renders the whole
+  // "Planned changes" as one ◇-prefixed event instead of many orphan
+  // vertical bars. Plain logger joins on newlines — output is identical.
+  const lines = ['Planned changes to settings.json:'];
   if (plan.existingCmd && plan.existingCmd !== plan.newCmd) {
-    console.log(`  .statusLine.command: ${JSON.stringify(plan.existingCmd)}`);
-    console.log(`                    → ${JSON.stringify(plan.newCmd)}`);
+    lines.push(`  .statusLine.command: ${JSON.stringify(plan.existingCmd)}`);
+    lines.push(`                    \u2192 ${JSON.stringify(plan.newCmd)}`);
   } else if (!plan.existingCmd) {
-    console.log(`  .statusLine.command = ${JSON.stringify(plan.newCmd)}  (new)`);
+    lines.push(`  .statusLine.command = ${JSON.stringify(plan.newCmd)}  (new)`);
   }
   if (!plan.hadRefresh) {
-    console.log('  .statusLine.refreshInterval = 1  (was unset) — enables scroll animation; ~60 shell invocations/minute');
+    lines.push('  .statusLine.refreshInterval = 1  (was unset) — enables scroll animation; ~60 shell invocations/minute');
   }
   const existingEnv = (plan.settings && plan.settings.env) || {};
   for (const [k, v] of Object.entries(plan.envUpdates)) {
     if (v === undefined) {
-      if (k in existingEnv) console.log(`  .env.${k}: cleared (revert to runtime default)`);
+      if (k in existingEnv) lines.push(`  .env.${k}: cleared (revert to runtime default)`);
     } else if (existingEnv[k] !== v) {
-      console.log(`  .env.${k} = ${JSON.stringify(v)}`);
+      lines.push(`  .env.${k} = ${JSON.stringify(v)}`);
     }
   }
+  ui.step(lines.join('\n'));
 }
 
-function applyPlan(plan, paths) {
+async function applyPlan(plan, paths, ui) {
+  ui = ui || createUILogger(null);
   fs.mkdirSync(paths.cfgDir, { recursive: true });
-  const bak = backup(paths.settingsPath);
-  if (bak) console.log(`✓ Backed up → ${bak}`);
 
-  // Transactional: stage both scripts into sibling tmp files, atomically
-  // patch settings.json, then rename the tmps into place. rename(2) on the
-  // same filesystem is atomic; copyFileSync is not, so writing directly to
+  // Scaffold the user-feeds directory on first install. Idempotent and
+  // non-transactional: failure here must not abort the main install (a
+  // read-only $HOME or a perms glitch shouldn't block the status line).
+  // `wx` flag writes only when the file doesn't exist, so a concurrent
+  // re-install or a user-edited README can't be clobbered — `EEXIST`
+  // falls through to the outer catch as a no-op. Avoids the existsSync
+  // + writeFileSync TOCTOU window.
+  try {
+    fs.mkdirSync(paths.userFeedsDir, { recursive: true });
+    fs.writeFileSync(paths.userFeedsReadme, USER_FEEDS_README, { flag: 'wx' });
+  } catch (_) { /* non-fatal (includes EEXIST on re-install) — install proceeds */ }
+
+  // Transactional: stage both scripts into sibling tmp files, rename them
+  // into place, then patch settings.json LAST. rename(2) on the same
+  // filesystem is atomic; copyFileSync is not, so writing directly to
   // scriptDest could leave a half-written file if we crash mid-copy.
-  // settings.json goes first so any failure before this point leaves the
-  // old state fully intact; failures after it leave stale scripts that the
-  // next install rewrites cleanly. Tmp files are unlinked on any throw.
-  const scriptTmp = tmpSibling(paths.scriptDest);
-  const colorsTmp = tmpSibling(paths.colorsDest);
+  //
+  // Ordering rationale: if settings.json were written FIRST and a rename
+  // then failed, settings would reference a scriptDest that doesn't exist —
+  // Claude Code would then log a "file not found" error on every status-
+  // line refresh. Writing settings LAST means any failure before the final
+  // settings write leaves the OLD state fully intact; the worst case is
+  // stale-but-valid scripts on disk that the next install rewrites cleanly.
+  //
+  // The cleanup trap unlinks both tmps on any throw. Once `renameSync`
+  // succeeds, the tmp path no longer exists, so `unlinkSync(tmp)` becomes
+  // a no-op (ENOENT is swallowed). That means cleanup is safe to call even
+  // after a partial advance — it only wipes what's still pending.
+  // Staging table: [src, dest, mode]. Every runtime file ships as one row.
+  // Adding a fourth file is one row, not three scattered edits.
+  const staged = [
+    [paths.scriptSrc,     paths.scriptDest,     0o755],
+    [paths.colorsSrc,     paths.colorsDest,     null],
+    [paths.xmlToJsonSrc,  paths.xmlToJsonDest,  0o755],
+  ].map(([src, dest, mode]) => ({ src, dest, mode, tmp: tmpSibling(dest) }));
   const cleanup = () => {
-    for (const p of [scriptTmp, colorsTmp]) {
-      try { fs.unlinkSync(p); } catch (_) { /* ignore ENOENT */ }
+    for (const { tmp } of staged) {
+      try { fs.unlinkSync(tmp); } catch (_) { /* ignore ENOENT */ }
     }
   };
 
-  try {
-    fs.copyFileSync(paths.scriptSrc, scriptTmp);
-    fs.chmodSync(scriptTmp, 0o755);
-    fs.copyFileSync(paths.colorsSrc, colorsTmp);
-
+  // Factor each transactional step into a closure so the clack path (rendered
+  // via tasks() with per-step spinners) and the plain path (flat log.success
+  // lines) share the same ordering and side effects.
+  const stepBackup = () => {
+    const bak = backup(paths.settingsPath);
+    return bak ? `Backed up \u2192 ${bak}` : 'No prior settings.json — nothing to back up';
+  };
+  const stepStage = () => {
+    for (const { src, tmp, mode } of staged) {
+      fs.copyFileSync(src, tmp);
+      if (mode !== null) fs.chmodSync(tmp, mode);
+    }
+    return `Staged \u2192 ${paths.scriptDest}`;
+  };
+  const stepPatch = () => {
+    // Install scripts first so settings.json never points at a file that
+    // isn't on disk yet. If any rename fails we throw before writing
+    // settings — old state survives intact.
+    for (const { tmp, dest } of staged) fs.renameSync(tmp, dest);
     const settings = plan.settings;
     settings.statusLine = settings.statusLine || {};
     settings.statusLine.type = 'command';
     settings.statusLine.command = plan.newCmd;
     if (!plan.hadRefresh) settings.statusLine.refreshInterval = 1;
-
     settings.env = reconcileEnv(settings.env, plan.envUpdates, plan.clearStaleEnv);
     if (Object.keys(settings.env).length === 0) delete settings.env;
-
     writeSettings(paths.settingsPath, settings);
-    fs.renameSync(scriptTmp, paths.scriptDest);
-    fs.renameSync(colorsTmp, paths.colorsDest);
+    return `Patched ${paths.settingsPath}`;
+  };
+
+  try {
+    if (ui.tasks) {
+      await ui.tasks([
+        { title: 'Backing up existing settings', task: async () => stepBackup() },
+        { title: 'Staging runtime scripts',      task: async () => stepStage()  },
+        { title: 'Patching settings.json',       task: async () => stepPatch()  },
+      ]);
+    } else {
+      ui.success(stepBackup());
+      stepStage();
+      ui.success(stepPatch());
+      ui.success(`Installed script \u2192 ${paths.scriptDest}`);
+    }
   } catch (e) {
     cleanup();
     throw e;
   }
-
-  console.log(`✓ Installed script → ${paths.scriptDest}`);
-  console.log(`✓ Patched ${paths.settingsPath}`);
 }
 
 async function install(opts) {
   const paths = installPaths();
-  if (!fs.existsSync(paths.scriptSrc) || !fs.existsSync(paths.colorsSrc)) {
+  if (!fs.existsSync(paths.scriptSrc) || !fs.existsSync(paths.colorsSrc) ||
+      !fs.existsSync(paths.xmlToJsonSrc)) {
     throw new Error('Installer files missing. Reinstall the package.');
   }
 
   // Interactive wizard on fresh TTY installs only. --yes, non-TTY, and any
   // explicit config flag keep the flag-driven path so scripts and CI
-  // never hit a hung stdin waiting for input.
+  // never hit a hung stdin waiting for input. The wizard also returns the
+  // loaded @clack/prompts module so the rest of install() can render
+  // through the same UI (log.*, outro) — one continuous clack flow from
+  // intro to final success.
   let wizardRan = false;
+  let clack = null;
   // Read once. The wizard pre-fills from settings.env; planInstall consumes
   // the same object. A re-run is a reconfigure, not a reset.
   const settings = readSettings(paths.settingsPath);
 
-  if (!opts.yes && process.stdin.isTTY && !hasExplicitConfig(opts)) {
-    wizardRan = await runWizard(opts, settings.env || {});
+  // CI environments often present a TTY (GitHub Actions does) but expect
+  // non-interactive behavior. Matching create-vite / pnpm create / gh, we
+  // treat CI=true as "never prompt", same as non-TTY.
+  const ciEnv = !!process.env.CI;
+  if (!opts.yes && process.stdin.isTTY && !ciEnv && !hasExplicitConfig(opts)) {
+    const r = await runWizard(opts, settings.env || {});
+    wizardRan = r.ran;
+    clack = r.clack;
   }
 
   validateFeeds(opts.disable);
@@ -1285,21 +1846,53 @@ async function install(opts) {
   opts.motion = validateMotion(opts.motion);
 
   const plan = planInstall(opts, paths, settings, wizardRan);
-  describePlan(plan);
+  const ui = createUILogger(clack);
+  describePlan(plan, ui);
 
-  // Wizard answers count as explicit confirmation — don't double-prompt.
-  if (!opts.yes && !wizardRan) {
-    if (!process.stdin.isTTY) {
-      console.error('\nError: stdin is not a TTY; refusing to auto-confirm.');
-      console.error('Re-run with --yes (or -y) to skip the confirmation prompt.');
-      return 1;
+  // Confirmation gate. Three paths converge here:
+  //   1. --yes            → skip entirely (unchanged contract).
+  //   2. flag path, TTY   → lazy-load clack and prompt (unchanged contract).
+  //   3. wizard path      → reuse the wizard's clack module and prompt AFTER
+  //                         describePlan, so the preview the user saw inside
+  //                         the wizard is now joined by the concrete diff
+  //                         against settings.json. Skip when the plan is a
+  //                         no-op — nothing to confirm and an extra Y/N beat
+  //                         would just read as friction.
+  //
+  // The non-TTY / CI branch only fires on flag-driven runs: a wizard can't
+  // have happened without a TTY, so wizardRan implies it's safe to prompt.
+  if (!opts.yes) {
+    if (!wizardRan) {
+      if (!process.stdin.isTTY || ciEnv) {
+        const why = ciEnv ? 'CI=true is set' : 'stdin is not a TTY';
+        console.error(`\nError: ${why}; refusing to auto-confirm.`);
+        console.error('Re-run with --yes (or -y) to skip the confirmation prompt.');
+        return 1;
+      }
+      const ok = await confirmProceed(null);
+      if (!ok) { console.log('Aborted.'); return 1; }
+    } else if (!isSettingsNoop(plan)) {
+      const ok = await confirmProceed(clack);
+      if (!ok) {
+        clack.cancel('Aborted.');
+        return 1;
+      }
     }
-    const ok = await confirm('\nProceed?');
-    if (!ok) { console.log('Aborted.'); return 1; }
   }
 
-  applyPlan(plan, paths);
-  console.log('\nDone. Restart Claude Code (or start a new session) to see the headline.');
+  await applyPlan(plan, paths, ui);
+  // On the wizard path, a terminal `log.success` before `outro` gives the
+  // vertical-bar UI a clear "done" beat separate from the reload hint —
+  // outro collapses the gutter, so a success line inside the flow reads
+  // better than stuffing both pieces of info into outro itself. On the
+  // flag path, one plain console.log keeps the prior visual.
+  const doneMsg = 'Restart Claude Code (or start a new session) to see the headline.';
+  if (clack) {
+    clack.log.success('Installed.');
+    clack.outro(doneMsg);
+  } else {
+    console.log(`\nDone. ${doneMsg}`);
+  }
   return 0;
 }
 
@@ -1338,7 +1931,7 @@ async function uninstall() {
     console.log(`✓ Removed claude-newsline from settings.json (backup: ${bak})`);
   }
 
-  for (const p of [paths.scriptDest, paths.colorsDest, paths.cacheFile]) {
+  for (const p of [paths.scriptDest, paths.colorsDest, paths.xmlToJsonDest, paths.cacheFile, paths.cachePendingFile]) {
     // unlink → catch ENOENT instead of existsSync+unlink: collapses the
     // TOCTOU window and tolerates the file being removed underneath us.
     try {
@@ -1347,6 +1940,11 @@ async function uninstall() {
     } catch (e) {
       if (e.code !== 'ENOENT') throw e;
     }
+  }
+  try {
+    fs.rmdirSync(paths.cacheLockDir);
+  } catch (e) {
+    if (e.code !== 'ENOENT' && e.code !== 'ENOTEMPTY' && e.code !== 'ENOTDIR') throw e;
   }
   // Remove cache/ only if empty. ENOTEMPTY means the user put something there.
   try {
@@ -1359,6 +1957,281 @@ async function uninstall() {
   return 0;
 }
 
+// --test-feed: spawn statusline.sh with NEWSLINE_TEST_FEED=<name> so the
+// diagnostic branch runs. Prefers the *installed* script (same version the
+// user actually sees at runtime) and falls back to the package's bin/
+// copy when they haven't installed yet (so `npx ... --test-feed foo`
+// works even on a fresh machine). Settings.json "env" is merged into the
+// child env — Claude Code injects it at runtime, so merging it here keeps
+// parameterized feeds (like reddit's NEWSLINE_REDDIT_SUBS) resolving to
+// the same value the user sees in production. process.env wins so users
+// can override ad hoc: `NEWSLINE_REDDIT_SUBS=rust npx ... --test-feed reddit`.
+async function testFeed(opts) {
+  const name = opts.testFeed;
+  // Pre-filter before handing to the shell. POSIX function-name rules —
+  // same check load_user_feeds does, mirrored here so a typo fails fast in
+  // Node with a clear message instead of tripping the bash-side validator.
+  if (!FEED_NAME_REGEX.test(name)) {
+    console.error(`Error: --test-feed expects a valid feed name (got ${JSON.stringify(name)})`);
+    console.error('Names must match [A-Za-z_][A-Za-z0-9_]* (POSIX function-name rules).');
+    return 2;
+  }
+
+  // --fixture short-circuits the curl step so authors can iterate on a jq
+  // filter without hitting the network. Validate early — an unreadable path
+  // or a --fixture without --test-feed is a user error we should catch in
+  // Node, not paper over with a bash-side empty read.
+  let fixtureAbs = null;
+  if (opts.fixture !== null) {
+    try {
+      const st = fs.statSync(opts.fixture);
+      if (!st.isFile()) {
+        console.error(`Error: --fixture expects a file (got ${JSON.stringify(opts.fixture)})`);
+        return 2;
+      }
+      fixtureAbs = path.resolve(opts.fixture);
+    } catch (e) {
+      console.error(`Error: --fixture ${JSON.stringify(opts.fixture)}: ${e.message}`);
+      return 2;
+    }
+  }
+
+  const paths = installPaths();
+  const scriptPath = fs.existsSync(paths.scriptDest) ? paths.scriptDest : paths.scriptSrc;
+  if (!fs.existsSync(scriptPath)) {
+    console.error(`Error: statusline.sh not found at ${scriptPath}`);
+    return 1;
+  }
+
+  // Merge settings.env into the child's env (process.env wins). Skip if
+  // settings.json is absent (fresh machine, nothing installed yet) — the
+  // user's own env or the runtime defaults will carry. readSettings throws
+  // on malformed JSON; surface that as a clean error rather than a stack.
+  const childEnv = { ...process.env };
+  if (fs.existsSync(paths.settingsPath)) {
+    try {
+      const settings = readSettings(paths.settingsPath);
+      const settingsEnv = (settings && settings.env) || {};
+      for (const [k, v] of Object.entries(settingsEnv)) {
+        if (childEnv[k] === undefined) childEnv[k] = v;
+      }
+    } catch (e) {
+      console.error(`Error: ${e.message}`);
+      return 1;
+    }
+  }
+  childEnv.NEWSLINE_TEST_FEED = name;
+  if (fixtureAbs !== null) childEnv.NEWSLINE_TEST_FEED_FIXTURE = fixtureAbs;
+
+  const { spawn } = require('child_process');
+  return new Promise((resolve) => {
+    const child = spawn('bash', [scriptPath], {
+      stdio: ['ignore', 'inherit', 'inherit'],
+      env: childEnv,
+    });
+    child.on('exit', (code, signal) => {
+      if (signal) resolve(1);
+      else resolve(code == null ? 1 : code);
+    });
+    child.on('error', (err) => {
+      console.error(`Error: ${err.message}`);
+      resolve(1);
+    });
+  });
+}
+
+// --new-feed: stamp a starter plugin file into $USER_FEEDS_DIR/<name>.sh and
+// exit. Validation mirrors load_user_feeds's name rules so a file this creates
+// is guaranteed loadable. Refuses to overwrite an existing file (an author
+// iterating on their own plugin shouldn't lose work to a re-run of this
+// command). Creates the feeds dir if it doesn't exist — first-time users who
+// haven't run install yet still get a working scaffold.
+function newFeed(opts) {
+  const name = opts.newFeed;
+  if (!FEED_NAME_REGEX.test(name)) {
+    console.error(`Error: --new-feed expects a valid feed name (got ${JSON.stringify(name)})`);
+    console.error('Names must match [A-Za-z_][A-Za-z0-9_]* (POSIX function-name rules).');
+    console.error('Examples: nyt, github_trending, my_feed');
+    return 2;
+  }
+  const paths = installPaths();
+  const dest = path.join(paths.userFeedsDir, `${name}.sh`);
+  if (fs.existsSync(dest)) {
+    console.error(`Error: ${dest} already exists — refusing to overwrite.`);
+    console.error(`Delete it first if you want a fresh template, or edit it in place.`);
+    return 1;
+  }
+  // Name collision with a built-in isn't fatal (user-feed overrides are a
+  // documented feature — statusline.sh's load_user_feeds dedupes), but it's
+  // almost always a surprise, so warn and keep going.
+  if (ALL_FEEDS.includes(name)) {
+    console.error(`Warning: "${name}" is also a built-in feed — this plugin will OVERRIDE it at load time.`);
+  }
+  try {
+    fs.mkdirSync(paths.userFeedsDir, { recursive: true });
+    // wx = O_EXCL: fail if it somehow appeared between the existsSync check
+    // and now (race is absurd in practice but the extra guard costs nothing).
+    fs.writeFileSync(dest, newFeedTemplate(name), { flag: 'wx', mode: 0o644 });
+  } catch (e) {
+    console.error(`Error: ${e.message}`);
+    return 1;
+  }
+  console.log(`Created ${dest}`);
+  console.log('');
+  console.log('Next steps:');
+  console.log(`  1. Edit the file — set LABEL, URL, JQ (and FEED_META description).`);
+  console.log(`  2. Test with a live fetch:   claude-newsline --test-feed ${name}`);
+  console.log(`  3. Or test offline:          claude-newsline --test-feed ${name} --fixture sample.json`);
+  console.log('');
+  console.log(`Feed will join the rotation next refresh (or restart Claude Code).`);
+  return 0;
+}
+
+// --list-feeds: show built-ins + user feeds, optionally with metadata.
+// Read from statusline.sh source (built-ins) and scan the feeds dir (user).
+// No sourcing needed — the metadata parser matches what sh reports at
+// NEWSLINE_DEBUG=1, so what users see here is what they'd see at runtime.
+function listFeeds(verbose) {
+  const paths = installPaths();
+  // scanAllUserFeeds returns both loadable and api-incompatible plugins so
+  // --list-feeds can surface the "I dropped this file but it's not running"
+  // case — silent-skip leaves users guessing. Partition into two groups:
+  // loadable ones join the main list; incompatible ones get a separate
+  // section so the user sees the file exists but knows why it's ignored.
+  const allUserFeeds = scanAllUserFeeds(paths.userFeedsDir);
+  const userFeeds = allUserFeeds.filter(f => f.compat.ok);
+  const incompatFeeds = allUserFeeds.filter(f => !f.compat.ok);
+  const userFeedNames = new Set(userFeeds.map(f => f.name));
+  const shSrc = readStatuslineSrc();
+
+  // Default category when a plugin didn't declare one. Built-ins set
+  // `category=News` explicitly; user plugins without metadata land in
+  // "Custom" — matches ccstatusline's convention for user-written widgets.
+  const defaultCategory = (isBuiltin) => isBuiltin ? 'News' : 'Custom';
+  const rows = [];
+  for (const f of ALL_FEEDS) {
+    const overridden = userFeedNames.has(f);
+    const meta = parseFeedMeta(shSrc, f);
+    rows.push({
+      name: f,
+      source: overridden ? 'built-in (overridden by user feed)' : 'built-in',
+      meta,
+      category: meta.category || defaultCategory(true),
+      isBuiltin: true,
+    });
+  }
+  for (const { name, path: p, meta: userMeta } of userFeeds) {
+    // User-owned file that also has a built-in name — the rotation will use
+    // the user version. Don't double-list; we already flagged the built-in
+    // row as overridden. But still print the user version below, since the
+    // user's metadata/description is what actually applies.
+    const isOverride = ALL_FEEDS.includes(name);
+    rows.push({
+      name,
+      source: isOverride ? `user override: ${p}` : `user: ${p}`,
+      meta: userMeta || {},
+      category: (userMeta && userMeta.category) || defaultCategory(false),
+      isBuiltin: false,
+    });
+  }
+
+  // Plain-list format of the incompat block is reused between verbose and
+  // non-verbose paths — builds lines like:
+  //   future.sh  (declares api=99, runtime supports up to 1)
+  // Returns an array of ready-to-print lines so callers control spacing.
+  const renderIncompatLines = () => incompatFeeds.map((f) => {
+    if (f.compat.reason === 'api') {
+      return `  ${f.name}  (declares api=${f.compat.declaredApi}, runtime supports up to ${f.compat.runtimeApi})`;
+    }
+    return `  ${f.name}  (${f.compat.reason})`;
+  });
+
+  if (!verbose) {
+    console.log('Built-in feeds:');
+    for (const r of rows.filter(r => r.isBuiltin)) {
+      const note = r.source.includes('overridden') ? '  (overridden by user feed)' : '';
+      console.log(`  ${r.name}${note}`);
+    }
+    if (userFeeds.length) {
+      console.log('');
+      console.log('User feeds:');
+      for (const { name } of userFeeds) console.log(`  ${name}`);
+      console.log('');
+      console.log(`(from ${paths.userFeedsDir})`);
+    } else {
+      console.log('');
+      console.log(`No user feeds. Scaffold one with:  claude-newsline --new-feed <name>`);
+      console.log(`(writes to ${paths.userFeedsDir})`);
+    }
+    // Incompat section only renders when there's something to say.
+    // Placement: below user feeds (or the empty-state hint) so the happy-
+    // path info isn't pushed down by rare failures, but still visible to
+    // anyone scanning the full output. Prefix with "⚠" to catch the eye
+    // without color escapes (which --list-feeds doesn't otherwise use).
+    if (incompatFeeds.length) {
+      console.log('');
+      console.log('⚠ Incompatible plugins (not loaded):');
+      for (const line of renderIncompatLines()) console.log(line);
+      console.log('');
+      console.log('These files are in your feeds dir but declare an api version');
+      console.log('newer than this runtime supports. Upgrade claude-newsline or');
+      console.log('edit the plugin to declare a supported api=.');
+    }
+    return 0;
+  }
+
+  // Verbose: group by category so a list of 10+ feeds scans at a glance.
+  // Stable order — categories appear in first-seen order (built-ins before
+  // user plugins, by scan order). Sorting alphabetically would re-home
+  // built-ins below "Custom" on a default install; not what users expect.
+  const byCategory = new Map();
+  for (const r of rows) {
+    if (!byCategory.has(r.category)) byCategory.set(r.category, []);
+    byCategory.get(r.category).push(r);
+  }
+  // These keys get the two-column render; everything else ("license",
+  // custom author-added keys) prints below verbatim. Kept as a single list
+  // so adding a recognized key touches one place.
+  const RECOGNIZED_KEYS = ['description', 'version', 'author', 'homepage', 'api'];
+  for (const [category, catRows] of byCategory.entries()) {
+    console.log(`[${category}]`);
+    for (const r of catRows) {
+      console.log(`  ${r.name}  [${r.source}]`);
+      for (const k of RECOGNIZED_KEYS) {
+        if (r.meta[k]) console.log(`    ${k.padEnd(12)} ${r.meta[k]}`);
+      }
+      // Surface uncommon keys the author included. The auto-attached
+      // `source=` is suppressed (already in the header bracket) and
+      // `category=` is suppressed (it's the group header).
+      for (const k of Object.keys(r.meta)) {
+        if (RECOGNIZED_KEYS.includes(k) || k === 'source' || k === 'category') continue;
+        console.log(`    ${k.padEnd(12)} ${r.meta[k]}`);
+      }
+      console.log('');
+    }
+  }
+  // Same incompat block as the non-verbose path, rendered under a trailing
+  // group header so it sits after all loadable-category groups. Re-uses
+  // renderIncompatLines for line-shape parity.
+  if (incompatFeeds.length) {
+    console.log('[⚠ Incompatible — not loaded]');
+    for (const f of incompatFeeds) {
+      console.log(`  ${f.name}  [user: ${f.path}]`);
+      if (f.compat.reason === 'api') {
+        console.log(`    reason       declares api=${f.compat.declaredApi}, runtime supports up to ${f.compat.runtimeApi}`);
+      } else {
+        console.log(`    reason       ${f.compat.reason}`);
+      }
+      // Still show the plugin's self-reported description/version so the
+      // user can identify which file this is without opening it.
+      if (f.meta.description) console.log(`    description  ${f.meta.description}`);
+      if (f.meta.version)     console.log(`    version      ${f.meta.version}`);
+      console.log('');
+    }
+  }
+  return 0;
+}
+
 async function main() {
   const opts = parseArgs(process.argv);
   if (opts.error) {
@@ -1367,7 +2240,15 @@ async function main() {
     return 2;
   }
   if (opts.help) { usage(); return 0; }
-  if (opts.listFeeds) { console.log(`Available feeds: ${ALL_FEEDS.join(', ')}`); return 0; }
+  // --fixture is only meaningful with --test-feed; a bare --fixture is a
+  // user error we should surface rather than silently discard.
+  if (opts.fixture !== null && opts.testFeed === null) {
+    console.error('Error: --fixture requires --test-feed <name>');
+    return 2;
+  }
+  if (opts.listFeeds) return listFeeds(opts.listFeedsVerbose);
+  if (opts.newFeed !== null) return newFeed(opts);
+  if (opts.testFeed !== null) return testFeed(opts);
   if (opts.uninstall) return uninstall();
   return install(opts);
 }
@@ -1394,6 +2275,13 @@ module.exports = {
   colorDepth,
   isValidRedditEntry,
   wizardInitialValues,
+  scanUserFeeds,
+  scanAllUserFeeds,
+  parseFeedMeta,
+  pluginApiVersion,
+  newFeedTemplate,
+  FEED_NAME_REGEX,
+  FEED_API_VERSION,
   ALL_FEEDS,
   PALETTE,
   DEFAULT_ROTATION_SEC,

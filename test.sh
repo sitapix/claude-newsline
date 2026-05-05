@@ -17,9 +17,10 @@ unset NEWSLINE_FEEDS_DISABLED NEWSLINE_REDDIT_SUBS NEWSLINE_ROTATION_SEC \
       NEWSLINE_REFRESH_SEC NEWSLINE_MAX_TITLE NEWSLINE_COLOR_FEED \
       NEWSLINE_COLOR_PREFIX NEWSLINE_PREFIX NEWSLINE_SHOW_LABELS \
       NEWSLINE_LABEL_SEP NEWSLINE_HYPERLINKS NEWSLINE_SCROLL \
-      NEWSLINE_SCROLL_SEC NEWSLINE_SCROLL_WIDTH NEWSLINE_SCROLL_SEPARATOR \
+      NEWSLINE_SCROLL_SEC NEWSLINE_SCROLL_SEPARATOR \
       NEWSLINE_CACHE_CHUNK NEWSLINE_CACHE_FILE NEWSLINE_USER_AGENT \
-      FORCE_HYPERLINK NEWSLINE_DEBUG
+      FORCE_HYPERLINK NEWSLINE_DEBUG \
+      NO_COLOR FORCE_COLOR COLORTERM
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 STATUSLINE="$SCRIPT_DIR/bin/statusline.sh"
@@ -145,12 +146,17 @@ prime_cache() {
   # Uninstall now removes the cache dir when empty; recreate on demand so
   # tests that install/uninstall repeatedly don't race with its absence.
   mkdir -p "$(dirname "$CACHE")"
+  # Drop any sibling double-buffer slot left over from a previous section —
+  # without this, a pending file from the last test can leak in and be
+  # promoted here, silently corrupting the primed content.
+  rm -f "$CACHE.pending"
   printf '%s\t%s\t%s\n' "${1:-}" "${2:-}" "${3:-}" > "$CACHE"
   touch "$CACHE"
 }
 
 prime_cache_multi() {
   mkdir -p "$(dirname "$CACHE")"
+  rm -f "$CACHE.pending"
   : > "$CACHE"
   while [ $# -gt 0 ]; do
     printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$CACHE"
@@ -295,6 +301,23 @@ out=$(FAKE_NOW=19 PATH="$fakedate_dir:$PATH" bash "$STATUSLINE" </dev/null)
 assert_contains "$out" "r/prog • Story Two" "final scroll frame reveals next headline"
 assert_not_contains "$out" $'\e]8;;' "scroll frames omit OSC 8 hyperlink"
 
+# Regression guard (M4): at the first scroll frame, the NEXT headline must
+# not yet be visible in the viewport. The original bug was that a fixed-
+# width viewport (SCROLL_WIDTH=MAX_TITLE=60) was wider than `cur + sep + next`
+# combined, so the next headline sat in-frame from the moment the scroll
+# started — it looked like a hard cut rather than a slide. We now size the
+# viewport per-frame to max(len(cur), len(next)) and pad both titles, so
+# `next` is genuinely off-viewport at the first motion step and slides in.
+#
+# We intentionally don't assert that `cur` is *fully* visible at frame 0 —
+# the current offset formula starts motion immediately (frame 0 shows
+# slide/S progress, not offset 0), so part of `cur` has already slid off
+# the left edge by frame 0. That's correct: every scroll frame is a motion
+# step, no frame duplicates the dwell.
+out=$(FAKE_NOW=15 PATH="$fakedate_dir:$PATH" bash "$STATUSLINE" </dev/null)
+assert_not_contains "$out" "Story Two" "first scroll frame must NOT expose the next headline yet"
+assert_contains "$out" "Story One" "first scroll frame still has cur visible (partial, but present)"
+
 out=$(NEWSLINE_SCROLL=0 FAKE_NOW=19 PATH="$fakedate_dir:$PATH" bash "$STATUSLINE" </dev/null)
 assert_contains "$out" "HN • Story One" "NEWSLINE_SCROLL=0 disables the transition (stays on current)"
 assert_contains "$out" $'\e]8;;https://example.com/1' "NEWSLINE_SCROLL=0 keeps OSC 8 at end of cycle"
@@ -322,6 +345,70 @@ for fake_now in 0 1 2 3 4 5; do
     fail "NEWSLINE_ROTATION_SEC=1 renders statically at FAKE_NOW=$fake_now" "got: $out"
   fi
 done
+
+}
+section "double-buffered cache: refresh is deferred to rotation boundary" && {
+# Regression guard: a cache refresh that lands mid-dwell must NOT change the
+# displayed headline until the next pos_in_cycle=0. Without double-buffering
+# (M3 in the audit), a user watching "Old Story" would suddenly see "New
+# Story" 3 seconds in because refresh_all_feeds overwrote $CACHE directly.
+prime_cache_multi \
+  "HN" "OldOne" "https://example.com/old1" \
+  "HN" "OldTwo" "https://example.com/old2"
+# Pre-seed a .pending that would normally be written by refresh_all_feeds
+# once a fresh cache exists.
+printf '%s\t%s\t%s\n' "HN" "NewOne" "https://example.com/new1" >  "$CACHE.pending"
+printf '%s\t%s\t%s\n' "HN" "NewTwo" "https://example.com/new2" >> "$CACHE.pending"
+# Make pending freshly-written so the REFRESH_SEC-based "stale cache → promote
+# immediately" path doesn't kick in (cache itself is just-touched too).
+touch "$CACHE.pending" "$CACHE"
+
+# FAKE_NOW=5: pos=5 of 20-sec rotation, mid-dwell of entry 1. Pending must
+# not be promoted; we must still see Old content.
+out=$(FAKE_NOW=5 PATH="$fakedate_dir:$PATH" bash "$STATUSLINE" </dev/null)
+assert_contains     "$out" "OldOne" "mid-dwell keeps showing old cache"
+assert_not_contains "$out" "NewOne" "pending cache not promoted mid-dwell"
+# Sanity: pending file should still exist after that read.
+if [ -s "$CACHE.pending" ]; then
+  pass "pending file survives a mid-dwell tick"
+else
+  fail "pending file survives a mid-dwell tick" "pending vanished at FAKE_NOW=5"
+fi
+
+# FAKE_NOW=20: pos_in_cycle = 20 % 20 = 0 (rotation boundary). Rotation
+# index advances: (int(20/20) % NR) + 1 = (1 % 2) + 1 = 2, so after
+# promotion we land on entry 2 = "NewTwo" (NOT NewOne — that's the entry
+# we'd see at FAKE_NOW=0, a full cycle earlier). Pending promotes and the
+# test proves both that the promotion happened AND that the rotation math
+# is consistent with the live cache.
+printf '%s\t%s\t%s\n' "HN" "NewOne" "https://example.com/new1" >  "$CACHE.pending"
+printf '%s\t%s\t%s\n' "HN" "NewTwo" "https://example.com/new2" >> "$CACHE.pending"
+touch "$CACHE.pending" "$CACHE"
+out=$(FAKE_NOW=20 PATH="$fakedate_dir:$PATH" bash "$STATUSLINE" </dev/null)
+assert_contains "$out" "NewTwo" "rotation boundary promotes pending (post-promotion entry 2 = NewTwo)"
+if [ ! -f "$CACHE.pending" ]; then
+  pass "pending file consumed after promotion"
+else
+  fail "pending file consumed after promotion" "pending still exists"
+fi
+
+# Stale-cache shortcut: if the live cache is past REFRESH_SEC, promotion
+# happens immediately regardless of pos_in_cycle. This keeps first-launch
+# and long-absence scenarios from forcing users to stare at stale content
+# until the next rotation boundary.
+#
+# We need three things for this test:
+#   1. Cache mtime = known, far-past → we use `perl utime` to set epoch 0.
+#      (touch -t is TZ-dependent and can't reach negative/zero epoch.)
+#   2. FAKE_NOW > REFRESH_SEC (600) so age > REFRESH_SEC triggers staleness.
+#   3. FAKE_NOW NOT a multiple of ROTATION_SEC (20) so pos != 0, to prove
+#      the staleness shortcut — not the boundary — fires the promotion.
+# 703 satisfies both: 703 - 0 = 703 > 600 ✓ stale, 703 % 20 = 3 ✗ not boundary.
+prime_cache "HN" "Stale" "https://example.com/stale"
+perl -e 'utime 0, 0, $ARGV[0]' "$CACHE"
+printf '%s\t%s\t%s\n' "HN" "Fresh" "https://example.com/fresh" > "$CACHE.pending"
+out=$(FAKE_NOW=703 PATH="$fakedate_dir:$PATH" bash "$STATUSLINE" </dev/null)
+assert_contains "$out" "Fresh" "stale cache triggers immediate pending promotion (no waiting for pos=0)"
 
 }
 section "title truncation" && {
@@ -354,6 +441,30 @@ out=$(FORCE_HYPERLINK=1 TERM_PROGRAM=Apple_Terminal bash "$STATUSLINE" </dev/nul
 assert_contains "$out" $'\e]8;;' "FORCE_HYPERLINK=1 trumps Apple_Terminal auto-disable"
 
 }
+section "OSC 8 URL scheme guard: non-http(s) URLs drop the hyperlink" && {
+# Defense against terminal URL-handler argument injection (CVE-2023-46321 iTerm2
+# x-man-page://, iTerm2 ssh://-E, Hyper RCE chains). A URL that escapes the
+# jq filter's expected http(s) shape or arrives via a tampered feed payload
+# must not be passed to the terminal's URL-handler via OSC 8 — we still
+# render the headline, just without the clickable link.
+
+# Malicious/non-http schemes get rendered unlinked
+for bad_url in 'x-man-page://foo' 'ssh://-E.profile' 'javascript:alert(1)' 'file:///etc/passwd' 'data:text/html,x'; do
+  prime_cache "HN" "Scheme Test" "$bad_url"
+  out=$(NEWSLINE_HYPERLINKS=always bash "$STATUSLINE" </dev/null)
+  assert_not_contains "$out" $'\e]8;;' "URL scheme '$bad_url' dropped from OSC 8"
+  assert_contains "$out" "HN • Scheme Test" "headline still rendered despite bad scheme"
+done
+
+# Control: http and https both pass through
+prime_cache "HN" "HTTP OK" "http://example.com/a"
+out=$(NEWSLINE_HYPERLINKS=always bash "$STATUSLINE" </dev/null)
+assert_contains "$out" $'\e]8;;http://example.com/a' "http:// passes the scheme guard"
+prime_cache "HN" "HTTPS OK" "https://example.com/b"
+out=$(NEWSLINE_HYPERLINKS=always bash "$STATUSLINE" </dev/null)
+assert_contains "$out" $'\e]8;;https://example.com/b' "https:// passes the scheme guard"
+
+}
 section "NO_COLOR suppresses all ANSI color output end-to-end" && {
 out=$(NO_COLOR=1 bash "$STATUSLINE" </dev/null)
 # No ESC[xxm anywhere — matches anything starting with ESC[ followed by
@@ -372,6 +483,7 @@ assert_contains "$out" "claude-newsline debug"          "debug banner present"
 assert_contains "$out" "CLAUDE_CONFIG_DIR ="            "shows config dir"
 assert_contains "$out" "NEWSLINE_COLOR_FEED"            "shows a knob name"
 assert_contains "$out" "red"                            "shows its resolved value"
+assert_contains "$out" "xml-to-json.js:"                "debug surfaces xml-to-json.js presence"
 # Attribution: NEWSLINE_COLOR_FEED was set in env, should say "env";
 # NEWSLINE_ROTATION_SEC was not, should say "default".
 line=$(printf '%s' "$out" | grep 'NEWSLINE_COLOR_FEED ')
@@ -379,12 +491,142 @@ case "$line" in *env*) pass "debug: NEWSLINE_COLOR_FEED attributed to env" ;; *)
 line=$(printf '%s' "$out" | grep 'NEWSLINE_ROTATION_SEC')
 case "$line" in *default*) pass "debug: NEWSLINE_ROTATION_SEC attributed to default" ;; *) fail "debug: NEWSLINE_ROTATION_SEC attributed to default" "got: $line" ;; esac
 
+# Deprecation notice: NEWSLINE_SCROLL_WIDTH was removed when render_scroll_window
+# started auto-deriving its width. A pinned user value must not silently noop —
+# debug surfaces it under a 'deprecated:' block with the ignored value echoed.
+out_dep=$(NEWSLINE_DEBUG=1 NEWSLINE_SCROLL_WIDTH=42 bash "$STATUSLINE" </dev/null)
+assert_contains "$out_dep" "deprecated:"              "debug surfaces deprecated-knob block when set"
+assert_contains "$out_dep" "NEWSLINE_SCROLL_WIDTH"    "deprecated knob is named"
+assert_contains "$out_dep" "42"                       "deprecated knob's ignored value is echoed"
+# And the block must NOT appear when the user has not set the variable.
+out_clean=$(env -u NEWSLINE_SCROLL_WIDTH NEWSLINE_DEBUG=1 bash "$STATUSLINE" </dev/null)
+assert_not_contains "$out_clean" "deprecated:"        "deprecated block absent when NEWSLINE_SCROLL_WIDTH unset"
+
+# Missing xml-to-json.js: copy only statusline.sh + colors.sh into a sandbox
+# and confirm the debug report tags it MISSING rather than pretending all is
+# well. The _SCRIPT_DIR check resolves at runtime, so relocating the script
+# is enough to trigger the missing-sibling path.
+orphan_dir="$SANDBOX/orphan-scripts"
+mkdir -p "$orphan_dir"
+cp "$STATUSLINE" "$orphan_dir/claude-newsline.sh"
+cp "$SCRIPT_DIR/bin/colors.sh" "$orphan_dir/colors.sh"
+out_missing=$(NEWSLINE_DEBUG=1 bash "$orphan_dir/claude-newsline.sh" </dev/null)
+assert_contains "$out_missing" "MISSING"              "debug flags missing xml-to-json.js"
+assert_contains "$out_missing" "FEED_PARSER=xml"      "missing-shim line names the parser it gates"
+
+}
+section "user feeds in \$NEWSLINE_FEEDS_DIR load and appear in rotation" && {
+# Scope the dir to this section so tests that don't set it keep using the
+# default empty behavior. `user_feeds_dir` is local-ish (bash 3+ quirk: a
+# bare "local" outside a function is a syntax error in some ports, but this
+# test harness is bash-only — we can use it freely).
+user_feeds_dir="$SANDBOX/user-feeds"
+mkdir -p "$user_feeds_dir"
+
+# A vanilla user feed. Same shape as built-ins: feed_<name>() sets LABEL/URL/JQ.
+cat > "$user_feeds_dir/myfeed.sh" <<'SH'
+feed_myfeed() {
+  LABEL='Mine'
+  URL='https://example.test/me'
+  JQ='.items[] | [$default, .title, .url] | @tsv'
+}
+SH
+
+out=$(NEWSLINE_FEEDS_DIR="$user_feeds_dir" NEWSLINE_DEBUG=1 bash "$STATUSLINE" </dev/null)
+assert_contains "$out" "myfeed"            "user feed 'myfeed' appears in debug report"
+assert_contains "$out" "$user_feeds_dir"   "debug report shows user feeds dir path"
+case "$out" in *"feeds enabled:"*"myfeed"*) pass "myfeed joins the enabled-feeds line" ;;
+               *) fail "myfeed joins the enabled-feeds line" "got: $(printf '%s' "$out" | grep 'feeds enabled')" ;; esac
+
+# Cleanup for subsequent sections.
+rm -rf "$user_feeds_dir"
+
+}
+section "user feeds: malformed or bad-name files are skipped and reported" && {
+user_feeds_dir="$SANDBOX/user-feeds-skip"
+mkdir -p "$user_feeds_dir"
+
+# Syntax-broken file — `. file` fails, no name appended to ALL_FEEDS.
+cat > "$user_feeds_dir/broken.sh" <<'SH'
+feed_broken() {
+  LABEL='Broken
+SH
+
+# File that sources fine but never defines feed_nodef — `command -v` guard
+# catches it, name is not appended.
+cat > "$user_feeds_dir/nodef.sh" <<'SH'
+# no feed_nodef defined here
+echo 'side effect suppressed' >/dev/null
+SH
+
+# Bad filename: leading digit → not a legal sh function name suffix.
+cat > "$user_feeds_dir/2fa.sh" <<'SH'
+feed_2fa() { LABEL='2FA'; URL='x'; JQ='.'; }
+SH
+
+# Bad filename: contains hyphen.
+cat > "$user_feeds_dir/my-feed.sh" <<'SH'
+feed_my-feed() { :; }
+SH
+
+out=$(NEWSLINE_FEEDS_DIR="$user_feeds_dir" NEWSLINE_DEBUG=1 bash "$STATUSLINE" </dev/null 2>&1)
+
+# Skipped plugins must NOT appear on the `feeds enabled:` line — they're
+# not wired into the rotation. Isolate that line so a later-block mention
+# (under "user feeds skipped:") doesn't cross-contaminate the assertion.
+enabled_line=$(printf '%s' "$out" | grep 'feeds enabled:')
+assert_not_contains "$enabled_line" "broken"   "syntax-broken plugin not in feeds enabled"
+assert_not_contains "$enabled_line" "nodef"    "plugin without feed_<name> not in feeds enabled"
+assert_not_contains "$enabled_line" "2fa"      "bad filename (leading digit) not in feeds enabled"
+assert_not_contains "$enabled_line" "my-feed"  "bad filename (hyphen) not in feeds enabled"
+
+# And they MUST appear under `user feeds skipped:` with a diagnostic —
+# this is the whole point of the surfaced-failure contract.
+assert_contains "$out" "user feeds skipped:"                "debug report has 'user feeds skipped:' header"
+assert_contains "$out" "broken"                             "syntax-broken plugin surfaced as skipped"
+assert_contains "$out" "source failed"                      "syntax-broken plugin reports source failure"
+assert_contains "$out" "nodef"                              "plugin without feed_<name> surfaced as skipped"
+assert_contains "$out" "feed_nodef function not defined"    "missing function reported with function name"
+assert_contains "$out" "2fa"                                "bad filename (leading digit) surfaced as skipped"
+assert_contains "$out" "bad filename"                       "bad filename diagnostic is present"
+assert_contains "$out" "my-feed"                            "bad filename (hyphen) surfaced as skipped"
+
+rm -rf "$user_feeds_dir"
+
+}
+section "user feed named 'hn' overrides built-in without duplicating the rotation slot" && {
+user_feeds_dir="$SANDBOX/user-feeds-override"
+mkdir -p "$user_feeds_dir"
+cat > "$user_feeds_dir/hn.sh" <<'SH'
+feed_hn() { LABEL='HN-override'; URL='https://example.test/hn'; JQ='.[] | [$default, .t, .u] | @tsv'; }
+SH
+
+out=$(NEWSLINE_FEEDS_DIR="$user_feeds_dir" NEWSLINE_DEBUG=1 bash "$STATUSLINE" </dev/null)
+# "feeds enabled: hn reddit lobsters" — user override must NOT add a second hn.
+enabled_line=$(printf '%s' "$out" | grep 'feeds enabled:')
+hn_count=$(printf '%s\n' "$enabled_line" | tr ' ' '\n' | grep -c '^hn$')
+assert_equals "$hn_count" "1" "override does not duplicate 'hn' in ALL_FEEDS"
+
+rm -rf "$user_feeds_dir"
+
+}
+section "missing \$NEWSLINE_FEEDS_DIR is not an error" && {
+out=$(NEWSLINE_FEEDS_DIR="$SANDBOX/does-not-exist" NEWSLINE_DEBUG=1 bash "$STATUSLINE" </dev/null 2>&1)
+assert_contains "$out" "feeds enabled:" "statusline still produces a debug report"
+assert_contains "$out" "(none loaded)"  "debug report reports empty user feeds cleanly"
+
 }
 section "PREFIX brand glyph renders to the left of every headline" && {
 prime_cache "HN" "Hello World" "https://example.com/1"
-# Strip ANSI SGR escapes so we assert on visible text only — the prefix has
-# its own color block, so raw bytes carry \e[0m between the glyph and the label.
-strip_ansi() { printf '%s' "$1" | LC_ALL=C sed -E 's/'$'\e''\[[0-9;]*m//g'; }
+# Strip ANSI SGR escapes and OSC 8 hyperlink wrappers so we assert on visible
+# text only — the prefix has its own color block (\e[0m between glyph and
+# label), and the glyph now sits outside the OSC 8 wrapper (so a \e]8;;URL\e\\
+# open escape sits between the glyph and the headline in raw bytes).
+strip_ansi() {
+  printf '%s' "$1" \
+    | LC_ALL=C sed $'s/\x1b\\[[0-9;]*m//g' \
+    | LC_ALL=C sed $'s/\x1b]8;;[^\x1b]*\x1b\\\\//g'
+}
 
 out=$(bash "$STATUSLINE" </dev/null)
 visible=$(strip_ansi "$out")
@@ -402,13 +644,14 @@ case "$visible" in
   *) pass "NEWSLINE_PREFIX='' leaves no leading space" ;;
 esac
 
-# NEWSLINE_PREFIX lives inside the OSC 8 wrapper so the whole line (including
-# glyph) is clickable — the hyperlink payload wraps everything.
+# NEWSLINE_PREFIX lives OUTSIDE the OSC 8 wrapper so the hover/cmd-click
+# underline doesn't extend under the brand glyph. The headline alone is the
+# clickable target.
 out=$(bash "$STATUSLINE" </dev/null)
 case "$out" in
-  *$'\e]8;;https://example.com/1\e\\'*"Ξ"*"Hello World"*$'\e]8;;\e\\'*)
-    pass "NEWSLINE_PREFIX sits inside the OSC 8 hyperlink" ;;
-  *) fail "NEWSLINE_PREFIX sits inside the OSC 8 hyperlink" "glyph not between OSC 8 open/close" ;;
+  *"Ξ"*$'\e]8;;https://example.com/1\e\\'*"Hello World"*$'\e]8;;\e\\'*)
+    pass "NEWSLINE_PREFIX sits outside the OSC 8 hyperlink" ;;
+  *) fail "NEWSLINE_PREFIX sits outside the OSC 8 hyperlink" "glyph not before OSC 8 open" ;;
 esac
 
 }
@@ -465,8 +708,6 @@ err=$(NEWSLINE_REFRESH_SEC=foo    bash "$STATUSLINE" </dev/null 2>&1 >/dev/null)
 assert_equals "$err" "" "NEWSLINE_REFRESH_SEC=foo emits no stderr"
 err=$(NEWSLINE_MAX_TITLE=0        bash "$STATUSLINE" </dev/null 2>&1 >/dev/null)
 assert_equals "$err" "" "NEWSLINE_MAX_TITLE=0 emits no stderr"
-err=$(NEWSLINE_SCROLL_WIDTH=xyz   bash "$STATUSLINE" </dev/null 2>&1 >/dev/null)
-assert_equals "$err" "" "NEWSLINE_SCROLL_WIDTH=xyz emits no stderr"
 
 }
 section "multi-byte title truncation does not produce U+FFFD replacement char" && {
@@ -493,10 +734,13 @@ section "multi-byte title in scroll window emits valid UTF-8 (no orphan bytes)" 
 prime_cache_multi \
   "HN"     "日本語テスト ABC"  "https://example.com/jp1" \
   "r/dev"  "日本語テスト XYZ"  "https://example.com/jp2"
-# Offset at each frame with ROTATION_SEC=20, SCROLL_SEC=5, SCROLL_WIDTH=60:
-# pos=15→0, pos=16→15, pos=17→30, pos=18→45, pos=19→60. Offsets 15/30/45
-# all land inside the 3-byte CJK codepoints when the prefix is "HN • "
-# (7 bytes) — so without the fix, frames 16/17/18 fail UTF-8 validation.
+# The viewport + offset formula (see render_scroll_window) is byte-based, so
+# at several intermediate frames the substr() slice lands mid-codepoint
+# inside the 3-byte CJK characters. iconv -c must drop the orphan bytes so
+# the final output is valid UTF-8. We don't hardcode offsets here — the
+# viewport width is now derived from the two headlines and may shift with
+# any algorithm tweak — so we exhaustively walk every scroll frame and
+# assert end-to-end UTF-8 validity instead of picking individual offsets.
 for t in 15 16 17 18 19; do
   out=$(FAKE_NOW=$t PATH="$fakedate_dir:$PATH" bash "$STATUSLINE" </dev/null)
   if printf '%s' "$out" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; then
@@ -504,6 +748,40 @@ for t in 15 16 17 18 19; do
   else
     fail "scroll frame FAKE_NOW=$t emits valid UTF-8" "iconv found invalid UTF-8 bytes"
   fi
+done
+
+}
+section "scroll render does not decode literal \\033 bytes in titles (ANSI injection guard)" && {
+# A feed title can legitimately contain the four text bytes "\033" (backslash,
+# '0', '3', '3') — the tr -d C0/C1 strip in _fetch_one only removes RAW
+# control bytes, not their \ddd text encoding. Prior render_scroll_window
+# code passed titles via `awk -v a=...`, which decodes POSIX string escapes
+# (\033 → ESC, \n → LF, \xHH, etc.) in the value before the awk program
+# runs. That turned attacker-controlled title text into real terminal
+# escape sequences during every scroll frame.
+#
+# The fix routes untrusted strings through ENVIRON[] (read verbatim, no
+# escape processing). This test primes a two-line cache with payload titles
+# and walks every scroll frame, asserting zero 0x1B bytes are sourced from
+# the title injection. Any regression (a future refactor that goes back to
+# `-v` for these inputs) fails loudly here.
+prime_cache_multi \
+  "HN"     'pre\033[41;97mHIJACK\033[0m post' "https://example.com/poc1" \
+  "r/sec"  'next\033[32mX\033[0m'             "https://example.com/poc2"
+# Default ROTATION_SEC=20, SCROLL_SEC=5 → frames at pos=15..19. Disable
+# color so the accent escapes from set_ansi don't pollute the ESC count;
+# the only 0x1B bytes remaining would then come from injection.
+for t in 15 16 17 18 19; do
+  out=$(NO_COLOR=1 FAKE_NOW=$t PATH="$fakedate_dir:$PATH" bash "$STATUSLINE" </dev/null)
+  esc_count=$(printf '%s' "$out" | LC_ALL=C tr -cd '\033' | wc -c | tr -d ' ')
+  if [ "$esc_count" = "0" ]; then
+    pass "scroll frame FAKE_NOW=$t contains no injected ESC bytes"
+  else
+    fail "scroll frame FAKE_NOW=$t contains no injected ESC bytes" "found $esc_count ESC byte(s)"
+  fi
+  # Payload bytes (the literal \033 text) MUST survive intact so the user
+  # sees what the feed actually said, not a silently-mangled string.
+  assert_contains "$out" '\033[' "literal backslash-ddd sequence preserved in scroll frame FAKE_NOW=$t"
 done
 
 }
@@ -603,6 +881,473 @@ fi
 
 # -----------------------------------------------------------------------------
 echo
+echo "=== bin/xml-to-json.js (RSS/Atom → JSON) ==="
+
+# xml-to-json.js reads an RSS or Atom document from stdin and writes a JSON
+# array of {title, link, description} objects — no label, no TSV. Labeling
+# and field projection happen in jq downstream, same as for JSON feeds. The
+# shape means an XML feed can use the full jq toolbox (filter, select,
+# rewrite titles, promote labels) — not just "title + link or bust."
+XML_TO_JSON="$SCRIPT_DIR/bin/xml-to-json.js"
+
+xml_to_json() {
+  # Usage: xml_to_json < xml_input — returns JSON on stdout, stderr merged
+  # so a parser throw surfaces in assertion failures rather than vanishing.
+  node "$XML_TO_JSON" 2>&1
+}
+
+section "xml-to-json: basic RSS emits array of objects" && {
+out=$(xml_to_json <<'XML'
+<?xml version="1.0"?>
+<rss version="2.0"><channel>
+  <title>Feed</title>
+  <item>
+    <title>First Post</title>
+    <link>https://example.com/1</link>
+    <description>First body</description>
+  </item>
+  <item>
+    <title>Second Post</title>
+    <link>https://example.com/2</link>
+  </item>
+</channel></rss>
+XML
+)
+assert_equals "$(echo "$out" | jq 'length')"               "2"                         "two items extracted"
+assert_equals "$(echo "$out" | jq -r '.[0].title')"        "First Post"                "first item title"
+assert_equals "$(echo "$out" | jq -r '.[0].link')"         "https://example.com/1"     "first item link"
+assert_equals "$(echo "$out" | jq -r '.[0].description')"  "First body"                "first item description"
+assert_equals "$(echo "$out" | jq -r '.[1].title')"        "Second Post"               "second item title"
+assert_equals "$(echo "$out" | jq -r '.[1].description')"  "null"                      "missing description → null"
+
+}
+section "xml-to-json: basic Atom uses href attribute for link" && {
+out=$(xml_to_json <<'XML'
+<?xml version="1.0"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <title>Atom One</title>
+    <link href="https://example.com/a1"/>
+    <summary>A summary</summary>
+  </entry>
+  <entry>
+    <title>Atom Two</title>
+    <link rel="alternate" href="https://example.com/a2" type="text/html"/>
+  </entry>
+</feed>
+XML
+)
+assert_equals "$(echo "$out" | jq -r '.[0].link')"        "https://example.com/a1"  "Atom link from href attribute"
+assert_equals "$(echo "$out" | jq -r '.[0].description')" "A summary"               "Atom <summary> maps to description"
+assert_equals "$(echo "$out" | jq -r '.[1].link')"        "https://example.com/a2"  "ignores rel/type on link tag"
+
+}
+section "xml-to-json: decodes named + numeric entities" && {
+# &amp; decoded LAST. Input &amp;lt; must stay as literal &lt;, not decode
+# twice to <. Numeric (&#58;) and hex (&#x2014;) both handled.
+out=$(xml_to_json <<'XML'
+<rss><channel>
+  <item>
+    <title>Tom &amp; Jerry&#58; &lt;Chase&gt; &#x2014; Don&#8217;t</title>
+    <link>https://example.com/ent</link>
+  </item>
+</channel></rss>
+XML
+)
+expected=$(printf 'Tom & Jerry: <Chase> \xe2\x80\x94 Don\xe2\x80\x99t')
+assert_equals "$(echo "$out" | jq -r '.[0].title')" "$expected" "named + decimal + hex entities all decode"
+
+}
+section "xml-to-json: strips CDATA in title and link" && {
+out=$(xml_to_json <<'XML'
+<rss><channel>
+  <item>
+    <title><![CDATA[Inside CDATA <with> "html"]]></title>
+    <link><![CDATA[https://example.com/cdata]]></link>
+  </item>
+</channel></rss>
+XML
+)
+assert_equals "$(echo "$out" | jq -r '.[0].title')" 'Inside CDATA <with> "html"' "CDATA unwrapped in title"
+assert_equals "$(echo "$out" | jq -r '.[0].link')"  'https://example.com/cdata'  "CDATA unwrapped in link"
+
+}
+section "xml-to-json: single-line minified XML still parses" && {
+out=$(xml_to_json <<'XML'
+<rss><channel><item><title>Minified</title><link>https://example.com/m</link></item><item><title>Two</title><link>https://example.com/m2</link></item></channel></rss>
+XML
+)
+assert_equals "$(echo "$out" | jq 'length')"        "2"                        "both items found"
+assert_equals "$(echo "$out" | jq -r '.[1].title')" "Two"                      "second item parsed"
+assert_equals "$(echo "$out" | jq -r '.[1].link')"  "https://example.com/m2"   "second item link parsed"
+
+}
+section "xml-to-json: skips items missing title or link" && {
+out=$(xml_to_json <<'XML'
+<rss><channel>
+  <item><title>Has Both</title><link>https://example.com/ok</link></item>
+  <item><title>No Link</title></item>
+  <item><link>https://example.com/no-title</link></item>
+  <item><title>Has Both Two</title><link>https://example.com/ok2</link></item>
+</channel></rss>
+XML
+)
+assert_equals "$(echo "$out" | jq 'length')"        "2"              "only complete items emitted"
+assert_equals "$(echo "$out" | jq -r '.[0].title')" "Has Both"       "first complete item"
+assert_equals "$(echo "$out" | jq -r '.[1].title')" "Has Both Two"   "second complete item (skipping middle two)"
+
+}
+section "xml-to-json: normalizes embedded tabs and newlines in fields" && {
+# A raw tab or newline in a title would render fine as JSON (escaped as \t
+# / \n), but downstream the jq filter emits @tsv and any literal \t/\n in
+# a field would corrupt the TSV record. Normalize to single space here so
+# the JSON shape is safe to feed directly to jq's @tsv.
+out=$(xml_to_json <<'XML'
+<rss><channel>
+  <item>
+    <title>Line one
+Line two	tabbed</title>
+    <link>https://example.com/ws</link>
+  </item>
+</channel></rss>
+XML
+)
+assert_equals "$(echo "$out" | jq -r '.[0].title')" "Line one Line two tabbed" "tabs + newlines in title collapse to spaces"
+
+}
+section "xml-to-json: empty input emits an empty array" && {
+out=$(printf '' | node "$XML_TO_JSON" 2>&1)
+status=$?
+assert_equals "$status" "0"  "empty stdin exits 0"
+assert_equals "$out" "[]"    "empty stdin → []"
+
+}
+section "xml-to-json: garbage input emits an empty array" && {
+out=$(printf 'not xml at all { "json": true }' | node "$XML_TO_JSON" 2>&1)
+status=$?
+assert_equals "$status" "0"  "non-XML garbage exits 0 (no crash)"
+assert_equals "$out" "[]"    "non-XML garbage → [] (jq never sees bad input)"
+
+}
+section "xml-to-json: Atom link falls back to text content" && {
+out=$(xml_to_json <<'XML'
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <title>Text Link</title>
+    <link>https://example.com/tl</link>
+  </entry>
+</feed>
+XML
+)
+assert_equals "$(echo "$out" | jq -r '.[0].link')" "https://example.com/tl" "non-spec <link>text</link> in Atom accepted"
+
+}
+section "xml-to-json: Atom prefers alternate link over self" && {
+out=$(xml_to_json <<'XML'
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <title>Alternate Link</title>
+    <link rel="self" href="https://example.com/feed/entry/1"/>
+    <link rel="alternate" href="https://example.com/story/1"/>
+  </entry>
+  <entry>
+    <title>No Rel Link</title>
+    <link rel="self" href="https://example.com/feed/entry/2"/>
+    <link href="https://example.com/story/2"/>
+  </entry>
+</feed>
+XML
+)
+assert_equals "$(echo "$out" | jq -r '.[0].link')" "https://example.com/story/1" "Atom rel=alternate preferred over rel=self"
+assert_equals "$(echo "$out" | jq -r '.[1].link')" "https://example.com/story/2" "Atom link with no rel preferred over rel=self"
+
+}
+section "xml-to-json: output is a valid JSON array (jq parseable)" && {
+# Structural invariant: regardless of input, output must always be valid
+# JSON — so the downstream jq never errors. This test covers the "the
+# pipeline contract holds" property across several inputs.
+for sample in \
+  '<?xml version="1.0"?><rss><channel></channel></rss>' \
+  '<rss><channel><item><title>x</title><link>https://x/1</link></item></channel></rss>' \
+  '' \
+  'garbage'; do
+  out=$(printf '%s' "$sample" | node "$XML_TO_JSON" 2>&1)
+  if echo "$out" | jq -e 'type == "array"' >/dev/null 2>&1; then
+    pass "valid JSON array for input: ${sample:0:40}"
+  else
+    fail "valid JSON array for input: ${sample:0:40}" "got: $out"
+  fi
+done
+
+}
+
+# -----------------------------------------------------------------------------
+echo
+echo "=== FEED_PARSER=xml plugin integration ==="
+
+# A plugin declaring FEED_PARSER=xml prepends xml-to-json.js to the jq
+# pipeline in _fetch_one. JQ then runs against a JSON array of
+# {title, link, description} objects — same jq expressiveness as a JSON
+# feed, just with an XML-parse step added upfront. When JQ is empty,
+# _parse_body supplies a default filter so the trivial "title + link"
+# case needs zero jq in the plugin.
+
+section "xml feed: refresh pipeline populates cache using default jq filter when JQ is empty" && {
+user_feeds_dir="$SANDBOX/user-feeds-xml"
+mkdir -p "$user_feeds_dir"
+cat > "$user_feeds_dir/xmlfeed.sh" <<'SH'
+feed_xmlfeed() {
+  LABEL='XFeed'
+  URL='https://example.test/rss.xml'
+  FEED_PARSER=xml
+}
+FEED_META_xmlfeed='api=2
+category=Custom
+description=Test RSS'
+SH
+
+# Mock curl: return a minimal RSS body. Discard all flags; shape is hard-
+# coded so the test is hermetic. `_fetch_one` invokes curl with --max-time
+# etc.; we just need stdout to produce valid RSS.
+make_mock_bin mock_curl_xml xmlfetch curl <<'MOCK'
+#!/bin/sh
+# Swallow args; emit a fixed RSS payload on stdout for _fetch_one's pipe.
+cat <<'XML'
+<?xml version="1.0"?>
+<rss version="2.0"><channel>
+  <title>Test Feed</title>
+  <item>
+    <title>XML Story One</title>
+    <link>https://example.test/xml/1</link>
+  </item>
+  <item>
+    <title>XML &amp; Story Two</title>
+    <link>https://example.test/xml/2</link>
+  </item>
+</channel></rss>
+XML
+MOCK
+
+rm -f "$CACHE" "$CACHE.pending" "$CACHE.lock"
+NEWSLINE_FEEDS_DIR="$user_feeds_dir" NEWSLINE_FEEDS_DISABLED="hn,reddit,lobsters" \
+  PATH="$mock_curl_xml:$PATH" bash "$STATUSLINE" </dev/null >/dev/null 2>&1
+wait_for_cache
+if [ -s "$CACHE" ]; then
+  pass "xml feed refresh populates cache (default jq filter)"
+else
+  fail "xml feed refresh populates cache (default jq filter)" "cache empty after refresh"
+fi
+
+# Entity decoding happens in xml-to-json; the TSV emission happens in jq.
+# `&amp;` must render as a literal `&` on the cache line or the render
+# path will just pass the escape through as-is.
+assert_contains "$(cat "$CACHE")" "$(printf 'XFeed\tXML Story One\thttps://example.test/xml/1')" \
+  "first item written as XFeed\\tTitle\\tURL"
+assert_contains "$(cat "$CACHE")" "$(printf 'XFeed\tXML & Story Two\thttps://example.test/xml/2')" \
+  "entity-decoded title survives the full xml-to-json | jq pipeline"
+
+if grep -q $'\t\t' "$CACHE"; then
+  fail "cache records are well-formed (no empty fields)" "$(grep -n $'\t\t' "$CACHE")"
+else
+  pass "cache records are well-formed (no empty fields)"
+fi
+
+rm -rf "$user_feeds_dir"
+rm -f "$CACHE" "$CACHE.pending"
+
+}
+section "xml feed: custom JQ filter runs on xml-to-json output" && {
+# The payoff of the xml-to-json refactor: XML feeds get full jq
+# expressiveness. This test proves it by declaring a filter that
+# (a) rewrites the label per-item based on the title and (b) drops
+# items matching a keyword — both impossible with a hardcoded TSV
+# emitter. Mirrors what feed_hn does for "Show HN:" prefixes.
+user_feeds_dir="$SANDBOX/user-feeds-xml-jq"
+mkdir -p "$user_feeds_dir"
+cat > "$user_feeds_dir/xmljq.sh" <<'SH'
+feed_xmljq() {
+  LABEL='X'
+  URL='https://example.test/rss.xml'
+  FEED_PARSER=xml
+  JQ='.[]
+      | select(.title | test("skip"; "i") | not)
+      | if (.title | test("^BREAKING: "))
+        then {label: "BREAKING", title: (.title | sub("^BREAKING: "; "")), link}
+        else {label: $default, title, link}
+        end
+      | [.label, .title, .link] | @tsv'
+}
+SH
+
+make_mock_bin mock_curl_xmljq xmljqfetch curl <<'MOCK'
+#!/bin/sh
+cat <<'XML'
+<rss><channel>
+  <item><title>BREAKING: Market drops</title><link>https://example.test/1</link></item>
+  <item><title>Normal item</title><link>https://example.test/2</link></item>
+  <item><title>Please skip me</title><link>https://example.test/3</link></item>
+  <item><title>BREAKING: New announcement</title><link>https://example.test/4</link></item>
+</channel></rss>
+XML
+MOCK
+
+rm -f "$CACHE" "$CACHE.pending" "$CACHE.lock"
+NEWSLINE_FEEDS_DIR="$user_feeds_dir" NEWSLINE_FEEDS_DISABLED="hn,reddit,lobsters" \
+  PATH="$mock_curl_xmljq:$PATH" bash "$STATUSLINE" </dev/null >/dev/null 2>&1
+wait_for_cache
+cache_content=$(cat "$CACHE" 2>/dev/null)
+
+assert_contains "$cache_content" "$(printf 'BREAKING\tMarket drops\thttps://example.test/1')" \
+  "BREAKING prefix promoted to label, stripped from title"
+assert_contains "$cache_content" "$(printf 'X\tNormal item\thttps://example.test/2')" \
+  "non-BREAKING item uses \$default label"
+assert_not_contains "$cache_content" "Please skip me" \
+  "item matching jq select() filter is excluded"
+assert_contains "$cache_content" "$(printf 'BREAKING\tNew announcement\thttps://example.test/4')" \
+  "second BREAKING item also promoted"
+
+rm -rf "$user_feeds_dir"
+rm -f "$CACHE" "$CACHE.pending"
+
+}
+section "xml feed: renders through statusline just like a jq feed" && {
+# Once the cache has a TSV line, the render path is identical to any other
+# feed — OSC 8 wrapping, label separator, color, the lot. This guards
+# against "works at refresh but breaks at render" drift: parse_line, the
+# URL scheme guard, and the label prefix all assume the TSV shape xml-to-
+# tsv produces.
+prime_cache "XFeed" "Rendered Headline" "https://example.test/x"
+out=$(run_statusline)
+assert_contains "$out" "XFeed • Rendered Headline"              "xml-sourced line renders with label prefix"
+assert_contains "$out" $'\e]8;;https://example.test/x'          "xml-sourced URL wrapped in OSC 8 hyperlink"
+
+}
+section "--test-feed works on an FEED_PARSER=xml plugin via --fixture" && {
+user_feeds_dir="$SANDBOX/user-feeds-xml-test"
+mkdir -p "$user_feeds_dir"
+cat > "$user_feeds_dir/xmltest.sh" <<'SH'
+feed_xmltest() {
+  LABEL='XT'
+  URL='https://example.test/t.xml'
+  FEED_PARSER=xml
+}
+SH
+
+fixture="$SANDBOX/xmltest.xml"
+cat > "$fixture" <<'XML'
+<?xml version="1.0"?>
+<rss><channel>
+  <item><title>Diag One</title><link>https://example.test/t/1</link></item>
+  <item><title>Diag Two</title><link>https://example.test/t/2</link></item>
+</channel></rss>
+XML
+
+out=$(NEWSLINE_FEEDS_DIR="$user_feeds_dir" \
+      node "$CLI" --test-feed xmltest --fixture "$fixture" 2>&1)
+status=$?
+assert_equals "$status" "0"                          "--test-feed on xml plugin exits 0"
+assert_contains "$out" "Testing feed: xmltest"       "header names the xml feed"
+assert_contains "$out" "2 rows"                      "row count surfaced in diagnostics"
+assert_contains "$out" "XT • Diag One"               "first xml row shown in sample"
+assert_contains "$out" "XT • Diag Two"               "second xml row shown in sample"
+
+rm -rf "$user_feeds_dir" "$fixture"
+
+}
+section "xml feed: plugin WITHOUT FEED_PARSER still flows through jq (regression)" && {
+# Drop a plugin that does NOT set FEED_PARSER; its JQ filter must still
+# run directly on the JSON body (no xml-to-json prefix). If the branch
+# leak accidentally routed JSON feeds through xml-to-json, the row count
+# would be zero (no <item> tags in JSON) and the cache would stay empty.
+user_feeds_dir="$SANDBOX/user-feeds-nonxml"
+mkdir -p "$user_feeds_dir"
+cat > "$user_feeds_dir/jsonfeed.sh" <<'SH'
+feed_jsonfeed() {
+  LABEL='JF'
+  URL='https://example.test/j'
+  JQ='.items[] | [$default, .title, .url] | @tsv'
+}
+SH
+make_mock_bin mock_curl_json jsonfetch curl <<'MOCK'
+#!/bin/sh
+cat <<'JSON'
+{"items":[{"title":"Jay","url":"https://example.test/j/1"}]}
+JSON
+MOCK
+rm -f "$CACHE" "$CACHE.pending" "$CACHE.lock"
+NEWSLINE_FEEDS_DIR="$user_feeds_dir" NEWSLINE_FEEDS_DISABLED="hn,reddit,lobsters" \
+  PATH="$mock_curl_json:$PATH" bash "$STATUSLINE" </dev/null >/dev/null 2>&1
+wait_for_cache
+assert_contains "$(cat "$CACHE")" "$(printf 'JF\tJay\thttps://example.test/j/1')" \
+  "plugin without FEED_PARSER still uses jq on the raw body (not xml-to-json)"
+rm -rf "$user_feeds_dir"
+rm -f "$CACHE" "$CACHE.pending"
+
+}
+section "xml feed: missing node binary degrades gracefully to empty bucket" && {
+# If node somehow isn't on PATH at refresh time, the xml pipeline produces
+# empty output — NOT a crash that would poison the cache. _fetch_one's
+# existing `2>/dev/null` discipline swallows spawn errors; `awk 'NF'` drops
+# empty lines, so the bucket for this feed just doesn't fill. Other feeds
+# in the same refresh tick are unaffected.
+user_feeds_dir="$SANDBOX/user-feeds-xml-nonode"
+mkdir -p "$user_feeds_dir"
+cat > "$user_feeds_dir/xn.sh" <<'SH'
+feed_xn() {
+  LABEL='XN'
+  URL='https://example.test/xn'
+  FEED_PARSER=xml
+}
+SH
+
+# PATH with only the mock curl dir + coreutils, no node. Use a minimal
+# PATH that deliberately excludes node's install dir. We shadow `node`
+# with a missing-command stub inside a dedicated dir to force failure
+# regardless of where the real binary lives on the test host.
+make_mock_bin mock_curl_xn xn_fetch curl <<'MOCK'
+#!/bin/sh
+cat <<'XML'
+<rss><channel><item><title>Should Never Appear</title><link>https://x/n</link></item></channel></rss>
+XML
+MOCK
+
+# "Break" node by putting a deliberately non-executable same-named file
+# earlier in PATH. Refresh finds our stub first, exec fails, downstream
+# awk 'NF' drops empties. Cache stays empty for this feed.
+mock_nonode="$SANDBOX/bin-nonode"
+mkdir -p "$mock_nonode"
+printf '#!/bin/sh\nexit 127\n' > "$mock_nonode/node"
+chmod +x "$mock_nonode/node"
+
+rm -f "$CACHE" "$CACHE.pending" "$CACHE.lock"
+NEWSLINE_FEEDS_DIR="$user_feeds_dir" NEWSLINE_FEEDS_DISABLED="hn,reddit,lobsters" \
+  PATH="$mock_nonode:$mock_curl_xn:$PATH" bash "$STATUSLINE" </dev/null >/dev/null 2>&1
+# Bounded poll instead of a flat sleep: exits early if the cache somehow
+# DOES fill (would be a leak), and caps at 0.5s total so the suite isn't
+# paying a fixed 0.5s penalty on every run. Matches wait_for_cache's shape
+# without its "cache must exist" semantics.
+for _i in 1 2 3 4 5; do
+  [ -s "$CACHE" ] && break
+  sleep 0.1
+done
+if [ -s "$CACHE" ]; then
+  # Cache exists but must not contain the xml feed's data (since node failed).
+  if grep -q "Should Never Appear" "$CACHE"; then
+    fail "broken node degrades xml feed to empty bucket" "xml content leaked in"
+  else
+    pass "broken node degrades xml feed to empty bucket"
+  fi
+else
+  pass "broken node degrades xml feed to empty bucket"
+fi
+
+rm -rf "$user_feeds_dir" "$mock_nonode"
+rm -f "$CACHE" "$CACHE.pending"
+
+}
+
+# -----------------------------------------------------------------------------
+echo
 echo "=== bin/claude-newsline.js (install) ==="
 
 section "install preserves unrelated keys" && {
@@ -651,9 +1396,41 @@ assert_equals "$count" "1" "re-install does not add a second claude-newsline ref
 assert_contains "$cmd_after" "my-statusline.sh" "user script still preserved after re-install"
 
 }
-section "install copies both statusline.sh and colors.sh" && {
+section "install copies runtime scripts (statusline.sh, colors.sh, xml-to-json.js)" && {
 assert_file_exists "$CLAUDE_CONFIG_DIR/claude-newsline.sh" "claude-newsline.sh installed"
 assert_file_exists "$CLAUDE_CONFIG_DIR/colors.sh"         "colors.sh installed"
+# xml-to-json.js runs at refresh time for FEED_PARSER=xml plugins — must
+# ship alongside statusline.sh or the v2 plugin contract silently breaks
+# (refresh would exec a missing file → empty bucket, no error surfaced).
+assert_file_exists "$CLAUDE_CONFIG_DIR/xml-to-json.js"    "xml-to-json.js installed"
+# Must be executable so the shebang line works when statusline.sh invokes
+# it via `node "$_SCRIPT_DIR/xml-to-json.js"` — node doesn't require +x on
+# the script argument, but shipping it non-executable would be a latent
+# trap for anyone who ever runs it directly.
+if [ -x "$CLAUDE_CONFIG_DIR/xml-to-json.js" ]; then
+  pass "xml-to-json.js is executable after install"
+else
+  fail "xml-to-json.js is executable after install" "mode: $(stat -f '%Lp' "$CLAUDE_CONFIG_DIR/xml-to-json.js" 2>/dev/null || stat -c '%a' "$CLAUDE_CONFIG_DIR/xml-to-json.js" 2>/dev/null)"
+fi
+
+}
+section "install scaffolds the user-feeds dir + README on first install" && {
+# Path must match statusline.sh's default: $CONFIG_DIR/claude-newsline/feeds.
+feeds_dir="$CLAUDE_CONFIG_DIR/claude-newsline/feeds"
+readme="$feeds_dir/README.md"
+assert_dir_exists "$feeds_dir" "user-feeds dir created"
+assert_file_exists "$readme"    "user-feeds README.md created"
+assert_contains "$(cat "$readme")" "feed_nyt"        "README includes the minimal feed template"
+assert_contains "$(cat "$readme")" "FEED_PARAMS"     "README documents parameterized feeds"
+
+}
+section "install does NOT overwrite a hand-edited user-feeds README" && {
+# Pre-seed a distinctive README, re-run install, verify content is preserved.
+feeds_dir="$CLAUDE_CONFIG_DIR/claude-newsline/feeds"
+readme="$feeds_dir/README.md"
+printf 'MY OWN NOTES\n' > "$readme"
+run_cli >/dev/null 2>&1
+assert_equals "$(cat "$readme")" "MY OWN NOTES" "hand-edited README survives re-install"
 
 }
 section "--disable writes .env.NEWSLINE_FEEDS_DISABLED" && {
@@ -1295,6 +2072,636 @@ sh_feeds=$(grep -E "^ALL_FEEDS=" "$SCRIPT_DIR/bin/statusline.sh" | sed "s/.*='\(
 assert_equals "$js_feeds" "$sh_feeds" "ALL_FEEDS constant matches across JS and sh"
 
 }
+section "FEED_PARAMS_<name> registry points at declared internal variables" && {
+# Every FEED_PARAMS_foo='BAR' declaration in statusline.sh must have a matching
+# `BAR="${NEWSLINE_BAR:-default}"` config line — otherwise the dispatch loop
+# reads an undefined variable and the parameterized feed silently never fires.
+# Catches the drift where someone adds FEED_PARAMS_newfeed='NEWFEED_SRCS' but
+# forgets to add the NEWFEED_SRCS="${NEWSLINE_NEWFEED_SRCS:-...}" line.
+missing=''
+while IFS= read -r declaration; do
+  # "FEED_PARAMS_reddit='REDDIT_SUBS'" → "REDDIT_SUBS"
+  internal=$(printf '%s' "$declaration" | sed "s/.*='\(.*\)'/\1/")
+  [ -n "$internal" ] || continue
+  if ! grep -qE "^${internal}=\"\\\$\\{NEWSLINE_${internal}[:-]" "$SCRIPT_DIR/bin/statusline.sh"; then
+    missing="$missing $internal"
+  fi
+done < <(grep -E "^FEED_PARAMS_[A-Za-z_][A-Za-z0-9_]*=" "$SCRIPT_DIR/bin/statusline.sh")
+if [ -z "$missing" ]; then
+  pass "every FEED_PARAMS_* has a matching internal config binding"
+else
+  fail "every FEED_PARAMS_* has a matching internal config binding" "missing config for:$missing"
+fi
+
+}
+section "--test-feed runs one fetch and reports diagnostics" && {
+# End-to-end happy path + failure modes for `claude-newsline --test-feed foo`.
+# Uses a mock curl in PATH that echoes a fixed meta line and writes a body to
+# the -o path. Real jq processes the body so the test exercises the full
+# curl → jq → tr → awk pipeline that statusline.sh uses at refresh time.
+
+# Drop a user feed that produces one good row.
+user_feeds_dir="$SANDBOX/user-feeds-testfeed"
+mkdir -p "$user_feeds_dir"
+cat > "$user_feeds_dir/sample.sh" <<'SH'
+feed_sample() {
+  LABEL='Sample'
+  URL='https://example.test/feed.json'
+  JQ='.items[] | [$default, .title, .url] | @tsv'
+}
+SH
+
+# Mock curl: writes a body to the file at -o and emits the meta format
+# statusline.sh requests via -w ("http_code|size_download|time_total").
+# The real shell-side parser splits on `|`, so match that shape exactly.
+make_mock_bin mock_curl_dir testfeed_ok curl <<'MOCK'
+#!/bin/sh
+# Consume args until -o, capture next arg as body path. Everything else
+# is ignored; we hard-code the response so the test is hermetic.
+body=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o) body=$2; shift 2 ;;
+    *)  shift ;;
+  esac
+done
+cat > "$body" <<'JSON'
+{"items":[{"title":"First","url":"https://example.test/a"},
+          {"title":"Second","url":"https://example.test/b"}]}
+JSON
+printf '200|143|0.042'
+MOCK
+
+out=$(PATH="$mock_curl_dir:$PATH" NEWSLINE_FEEDS_DIR="$user_feeds_dir" \
+      node "$CLI" --test-feed sample 2>&1)
+status=$?
+assert_equals "$status" "0"                         "--test-feed exits 0 on success"
+assert_contains "$out" "Testing feed: sample"       "header names the feed"
+assert_contains "$out" "URL:"                        "shows URL line"
+assert_contains "$out" "https://example.test/feed.json" "shows resolved URL"
+assert_contains "$out" "200"                         "shows HTTP code"
+assert_contains "$out" "2 rows"                      "shows jq row count"
+assert_contains "$out" "Sample • First"              "sample shows first row"
+assert_contains "$out" "Sample • Second"             "sample shows second row"
+assert_contains "$out" $'\xe2\x9c\x93'               "success marker rendered"
+
+# Failure: jq produces zero rows (empty items array, valid JSON shape)
+make_mock_bin mock_curl_dir2 testfeed_empty curl <<'MOCK'
+#!/bin/sh
+body=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in -o) body=$2; shift 2 ;; *) shift ;; esac
+done
+printf '{"items":[]}' > "$body"
+printf '200|12|0.01'
+MOCK
+out=$(PATH="$mock_curl_dir2:$PATH" NEWSLINE_FEEDS_DIR="$user_feeds_dir" \
+      node "$CLI" --test-feed sample 2>&1)
+status=$?
+assert_equals "$status" "1"                          "--test-feed exits non-zero on zero rows"
+assert_contains "$out" "0 rows"                      "zero-row failure is reported"
+
+# Warning: non-http URL in jq output triggers scheme-guard notice
+cat > "$user_feeds_dir/bad_scheme.sh" <<'SH'
+feed_bad_scheme() {
+  LABEL='Bad'
+  URL='https://example.test/feed.json'
+  JQ='.items[] | [$default, .title, .url] | @tsv'
+}
+SH
+make_mock_bin mock_curl_dir3 testfeed_badurl curl <<'MOCK'
+#!/bin/sh
+body=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in -o) body=$2; shift 2 ;; *) shift ;; esac
+done
+cat > "$body" <<'JSON'
+{"items":[{"title":"Sketchy","url":"javascript:alert(1)"}]}
+JSON
+printf '200|60|0.01'
+MOCK
+out=$(PATH="$mock_curl_dir3:$PATH" NEWSLINE_FEEDS_DIR="$user_feeds_dir" \
+      node "$CLI" --test-feed bad_scheme 2>&1)
+assert_contains "$out" "URL scheme not http(s)"      "scheme guard warning surfaces"
+assert_contains "$out" "javascript:alert(1)"         "offending URL is shown"
+
+# Unknown feed: exits 2 with available list
+out=$(node "$CLI" --test-feed nonexistent 2>&1)
+status=$?
+assert_equals "$status" "2"                          "--test-feed unknown exits 2"
+assert_contains "$out" "unknown feed: nonexistent"   "unknown feed error is clear"
+assert_contains "$out" "available:"                  "available feeds listed"
+
+# Name validation: a shell-metachar name is rejected in Node before shelling out
+out=$(node "$CLI" --test-feed 'foo;rm' 2>&1)
+status=$?
+assert_equals "$status" "2"                          "--test-feed rejects shell-metachar name"
+assert_contains "$out" "valid feed name"             "metachar rejection message is clear"
+
+# Settings.json env passthrough: a FEED_PARAMS feed reads its CSV from the
+# env var. When settings.json has it, the child should see it.
+cat > "$user_feeds_dir/pfeed.sh" <<'SH'
+feed_pfeed() {
+  _e=$1
+  case "$_e" in ''|*[!A-Za-z0-9_]*) return 1 ;; esac
+  LABEL="p/$_e"
+  URL="https://example.test/$_e"
+  JQ='.items[] | [$default, .title, .url] | @tsv'
+}
+FEED_PARAMS_pfeed='PFEED_ENTRIES'
+SH
+# settings.env.PFEED_ENTRIES is consulted by the installer and injected
+# into the spawned shell; statusline.sh resolves the internal name
+# via PFEED_ENTRIES="${NEWSLINE_PFEED_ENTRIES:-...}" — for user feeds the
+# internal var is set directly by convention.
+cat > "$SETTINGS" <<'JSON'
+{"env":{"PFEED_ENTRIES":"alpha,beta"}}
+JSON
+make_mock_bin mock_curl_dir4 testfeed_pfeed curl <<'MOCK'
+#!/bin/sh
+body=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in -o) body=$2; shift 2 ;; *) shift ;; esac
+done
+cat > "$body" <<'JSON'
+{"items":[{"title":"p","url":"https://x.test/p"}]}
+JSON
+printf '200|40|0.01'
+MOCK
+out=$(PATH="$mock_curl_dir4:$PATH" NEWSLINE_FEEDS_DIR="$user_feeds_dir" \
+      node "$CLI" --test-feed pfeed 2>&1)
+status=$?
+assert_equals "$status" "0"                          "--test-feed iterates FEED_PARAMS entries"
+assert_contains "$out" "parameterized via PFEED_ENTRIES" "shows param var name in header"
+assert_contains "$out" "[1/2]"                        "per-entry progress shown (1/2)"
+assert_contains "$out" "[2/2]"                        "per-entry progress shown (2/2)"
+assert_contains "$out" "p/alpha"                      "first CSV entry resolved"
+assert_contains "$out" "p/beta"                       "second CSV entry resolved"
+assert_contains "$out" "All 2 entries OK"             "summary counts successes"
+
+# Cleanup
+rm -rf "$user_feeds_dir"
+echo '{}' > "$SETTINGS"
+
+}
+
+section "--test-feed --fixture skips the network and pipes the file into jq" && {
+# Fixture mode replaces curl with a local file read. The test asserts that:
+#   - exit 0 when jq accepts the fixture
+#   - no 'HTTP:' line is printed (curl wasn't invoked)
+#   - a 'Fixture:' line is printed with the path and byte count
+#   - jq output is identical to what a live-URL run would produce
+# Also covers the guard rails: missing file fails fast (exit 2), and
+# --fixture without --test-feed is rejected up front (no silent discard).
+user_feeds_dir="$SANDBOX/user-feeds-fixture"
+mkdir -p "$user_feeds_dir"
+cat > "$user_feeds_dir/fixfeed.sh" <<'SH'
+feed_fixfeed() {
+  LABEL='Fix'
+  URL='https://example.test/would-be-live.json'
+  JQ='.items[] | [$default, .title, .url] | @tsv'
+}
+SH
+fixture_path="$SANDBOX/fixture-happy.json"
+cat > "$fixture_path" <<'JSON'
+{"items":[{"title":"OfflineA","url":"https://example.test/a"},
+          {"title":"OfflineB","url":"https://example.test/b"}]}
+JSON
+
+# Shadow curl with a failing stub. If fixture mode leaks into the curl
+# branch, the test fails loudly instead of silently masking the regression.
+no_curl_dir="$SANDBOX/no-curl"
+mkdir -p "$no_curl_dir"
+cat > "$no_curl_dir/curl" <<'SH'
+#!/bin/sh
+echo "FIXTURE MODE SHOULD NOT CALL CURL" >&2
+exit 99
+SH
+chmod +x "$no_curl_dir/curl"
+
+out=$(PATH="$no_curl_dir:$PATH" NEWSLINE_FEEDS_DIR="$user_feeds_dir" \
+      node "$CLI" --test-feed fixfeed --fixture "$fixture_path" 2>&1)
+status=$?
+assert_equals "$status" "0"                         "--test-feed --fixture exits 0"
+assert_contains "$out" "Fixture:"                   "Fixture: line is printed"
+assert_contains "$out" "$fixture_path"              "fixture path is shown"
+assert_contains "$out" "no network"                 "offline tag is shown"
+assert_contains "$out" "2 rows"                     "jq still processed fixture rows"
+assert_contains "$out" "Fix • OfflineA"             "first sample row renders"
+assert_contains "$out" "Fix • OfflineB"             "second sample row renders"
+case "$out" in
+  *"HTTP:"*) fail "--test-feed --fixture must NOT print HTTP: (curl was called)" ;;
+  *)         pass "--test-feed --fixture does not call curl" ;;
+esac
+
+# Missing fixture: Node validates before spawning bash.
+out=$(NEWSLINE_FEEDS_DIR="$user_feeds_dir" \
+      node "$CLI" --test-feed fixfeed --fixture /definitely/does/not/exist 2>&1)
+status=$?
+assert_equals "$status" "2"                         "--test-feed --fixture rejects missing file"
+assert_contains "$out" "--fixture"                  "error message mentions --fixture"
+
+# --fixture without --test-feed: nonsense combo.
+out=$(node "$CLI" --fixture "$fixture_path" 2>&1)
+status=$?
+assert_equals "$status" "2"                         "--fixture without --test-feed rejected"
+assert_contains "$out" "--fixture requires --test-feed" "error identifies the right missing flag"
+
+rm -rf "$user_feeds_dir" "$no_curl_dir" "$fixture_path"
+
+}
+
+section "--new-feed scaffolds a loadable plugin file" && {
+# Stamps a starter feed_<name> plugin into \$CLAUDE_CONFIG_DIR/claude-newsline/feeds/
+# and asserts the resulting file is syntactically valid + loadable by sh.
+# Also covers: existing files are not overwritten, invalid names are
+# rejected, and a built-in collision emits a warning (but still succeeds —
+# user override is a documented feature).
+scaffold_dir="$SANDBOX/cfg-scaffold"
+rm -rf "$scaffold_dir"
+mkdir -p "$scaffold_dir"
+
+out=$(CLAUDE_CONFIG_DIR="$scaffold_dir" node "$CLI" --new-feed nyt 2>&1)
+status=$?
+assert_equals "$status" "0"                          "--new-feed nyt exits 0"
+assert_contains "$out" "Created"                     "success message printed"
+assert_contains "$out" "nyt.sh"                      "filename is shown"
+assert_contains "$out" "--test-feed nyt"             "next-steps hint shows test command"
+
+plugin="$scaffold_dir/claude-newsline/feeds/nyt.sh"
+[ -s "$plugin" ] && pass "scaffolded file exists and is non-empty" \
+                 || fail "scaffolded file missing at $plugin"
+grep -q '^feed_nyt()' "$plugin" && pass "scaffolded file defines feed_nyt()" \
+                               || fail "scaffolded file lacks feed_nyt()"
+grep -q '^FEED_META_nyt=' "$plugin" && pass "scaffolded file includes FEED_META block" \
+                                   || fail "scaffolded file lacks FEED_META block"
+
+# Sh-side loadability: source the file in a subshell and confirm the function
+# is defined. Guards against template drift that Node parses fine but sh
+# trips over.
+sh -c ". \"$plugin\" && command -v feed_nyt" >/dev/null
+assert_equals "$?" "0"                               "scaffolded plugin sources cleanly"
+
+# Collision: a second --new-feed nyt must refuse.
+out=$(CLAUDE_CONFIG_DIR="$scaffold_dir" node "$CLI" --new-feed nyt 2>&1)
+status=$?
+assert_equals "$status" "1"                          "--new-feed refuses to overwrite"
+assert_contains "$out" "already exists"              "collision message explains why"
+
+# Bad names: leading digit + hyphen.
+out=$(CLAUDE_CONFIG_DIR="$scaffold_dir" node "$CLI" --new-feed 2fa 2>&1)
+status=$?
+assert_equals "$status" "2"                          "--new-feed rejects leading-digit name"
+assert_contains "$out" "valid feed name"             "rejection message is clear"
+
+out=$(CLAUDE_CONFIG_DIR="$scaffold_dir" node "$CLI" --new-feed my-feed 2>&1)
+status=$?
+assert_equals "$status" "2"                          "--new-feed rejects hyphenated name"
+
+# Built-in collision: succeeds but warns.
+out=$(CLAUDE_CONFIG_DIR="$scaffold_dir" node "$CLI" --new-feed hn 2>&1)
+status=$?
+assert_equals "$status" "0"                          "--new-feed <builtin-name> still succeeds"
+assert_contains "$out" "OVERRIDE"                    "override warning surfaces"
+
+rm -rf "$scaffold_dir"
+
+}
+
+section "FEED_API_VERSION gate: plugins declaring a future api are skipped" && {
+# The sh-side runtime (load_user_feeds) and the installer (scanUserFeeds)
+# must agree on what's loadable. A plugin declaring api > FEED_API_VERSION
+# is skipped at both layers — runtime doesn't call it, installer doesn't
+# surface it in --list-feeds or the wizard. Plugins with no api / non-
+# numeric api get implicit v1 for backward compat with files written
+# before this gate existed.
+api_dir="$SANDBOX/cfg-api"
+rm -rf "$api_dir"
+mkdir -p "$api_dir/claude-newsline/feeds"
+
+# Three shapes: future-api (skipped), explicit v1 (loaded), no api (loaded).
+cat > "$api_dir/claude-newsline/feeds/future.sh" <<'SH'
+FEED_META_future='description=Plugin from the year 3000
+api=99
+category=Future'
+feed_future() { LABEL='F'; URL='https://x'; JQ='.'; }
+SH
+cat > "$api_dir/claude-newsline/feeds/present.sh" <<'SH'
+FEED_META_present='description=Explicit v1
+api=1'
+feed_present() { LABEL='P'; URL='https://x'; JQ='.'; }
+SH
+cat > "$api_dir/claude-newsline/feeds/legacy.sh" <<'SH'
+FEED_META_legacy='description=Pre-gate plugin, no api declared'
+feed_legacy() { LABEL='L'; URL='https://x'; JQ='.'; }
+SH
+# Non-numeric api: installer treats as v1 per the "absent/non-numeric
+# is implicit v1" rule. The sh-side loader has the same contract.
+cat > "$api_dir/claude-newsline/feeds/sloppy.sh" <<'SH'
+FEED_META_sloppy='description=Author typed "latest" instead of a number
+api=latest'
+feed_sloppy() { LABEL='S'; URL='https://x'; JQ='.'; }
+SH
+cat > "$api_dir/claude-newsline/feeds/broken.sh" <<'SH'
+FEED_META_broken='description=Syntax-broken plugin'
+feed_broken( {
+SH
+cat > "$api_dir/claude-newsline/feeds/nofunc.sh" <<'SH'
+FEED_META_nofunc='description=Missing function plugin'
+SH
+
+# Installer-side (scanUserFeeds, via --list-feeds):
+out=$(CLAUDE_CONFIG_DIR="$api_dir" node "$CLI" --list-feeds 2>&1)
+assert_contains "$out" "present"                     "explicit api=1 plugin is listed"
+assert_contains "$out" "legacy"                      "no-api plugin is listed (implicit v1)"
+assert_contains "$out" "sloppy"                      "non-numeric api falls back to v1"
+# future-api plugin must NOT appear in the loadable "User feeds:" block —
+# but it SHOULD appear in the separate Incompatible section so users see
+# why their dropped-in plugin isn't loading. Structural check: split on
+# the Incompatible header and assert future shows up only after it.
+loadable_block=$(printf '%s\n' "$out" | awk '/^⚠ Incompatible/{exit} {print}')
+case "$loadable_block" in
+  *"future"*) fail "future-api plugin must not appear in loadable block" ;;
+  *)          pass "loadable block excludes future-api plugin" ;;
+esac
+case "$loadable_block" in
+  *"broken"*) fail "broken plugin must not appear in loadable block" ;;
+  *)          pass "loadable block excludes syntax-broken plugin" ;;
+esac
+case "$loadable_block" in
+  *"nofunc"*) fail "missing-function plugin must not appear in loadable block" ;;
+  *)          pass "loadable block excludes missing-function plugin" ;;
+esac
+assert_contains "$out" "Incompatible plugins"        "Incompatible section surfaces future-api plugin"
+assert_contains "$out" "declares api=99"             "Incompatible block shows declared api"
+assert_contains "$out" "broken"                      "Incompatible section surfaces syntax-broken plugin"
+assert_contains "$out" "source failed"               "syntax-broken plugin reports source failure"
+assert_contains "$out" "nofunc"                      "Incompatible section surfaces missing-function plugin"
+assert_contains "$out" "feed_nofunc function not defined" "missing-function plugin reports missing function"
+
+# Sh-side (load_user_feeds, via NEWSLINE_DEBUG=1):
+out=$(NEWSLINE_FEEDS_DIR="$api_dir/claude-newsline/feeds" NEWSLINE_DEBUG=1 \
+      bash "$STATUSLINE" </dev/null 2>&1)
+# `feeds enabled:` line lists every ALL_FEEDS entry that passed the gate.
+enabled_line=$(printf '%s\n' "$out" | grep '^feeds enabled:')
+case "$enabled_line" in
+  *present*)  pass "sh-side loads present (api=1)" ;;
+  *)          fail "sh-side did not load present; got: $enabled_line" ;;
+esac
+case "$enabled_line" in
+  *legacy*)   pass "sh-side loads legacy (no api → implicit v1)" ;;
+  *)          fail "sh-side did not load legacy; got: $enabled_line" ;;
+esac
+case "$enabled_line" in
+  *sloppy*)   pass "sh-side loads sloppy (non-numeric api → implicit v1)" ;;
+  *)          fail "sh-side did not load sloppy; got: $enabled_line" ;;
+esac
+case "$enabled_line" in
+  *future*)   fail "sh-side loaded future (api=99) but should have skipped" ;;
+  *)          pass "sh-side skips future-api plugin" ;;
+esac
+case "$enabled_line" in
+  *broken*)   fail "sh-side loaded broken plugin but should have skipped" ;;
+  *)          pass "sh-side skips syntax-broken plugin" ;;
+esac
+case "$enabled_line" in
+  *nofunc*)   fail "sh-side loaded nofunc plugin but should have skipped" ;;
+  *)          pass "sh-side skips missing-function plugin" ;;
+esac
+
+rm -rf "$api_dir"
+
+}
+
+section "FEED_API_VERSION stays in sync between statusline.sh and claude-newsline.js" && {
+# Same drift-prevention pattern as ALL_FEEDS / DEFAULT_ROTATION_SEC — the
+# sh side is canonical, the JS side mirrors. A silent divergence would
+# surface as "the runtime dropped my plugin but the installer said it
+# was fine" (or vice versa).
+sh_ver=$(grep -m1 '^FEED_API_VERSION=' "$STATUSLINE" | cut -d= -f2)
+js_ver=$(node -e "console.log(require('$CLI').FEED_API_VERSION)")
+assert_equals "$js_ver" "$sh_ver" "JS FEED_API_VERSION matches sh FEED_API_VERSION"
+
+# pluginApiVersion: absent / empty / non-numeric → 1 (backward compat).
+# Explicit numeric → the number.
+out=$(node -e "
+  const m = require('$CLI');
+  const f = m.pluginApiVersion;
+  console.log([f({}), f({api:''}), f({api:'latest'}), f({api:'1'}), f({api:'3'})].join(','));
+")
+assert_equals "$out" "1,1,1,1,3" "pluginApiVersion: absent/empty/non-numeric → 1; numeric passthrough"
+
+}
+
+section "--list-feeds surfaces api-incompatible plugins under an Incompatible section" && {
+# Silent-skip on incompatibility is wrong UX — a user who drops a plugin
+# needs visible feedback when the runtime won't load it. This test asserts
+# both the plain and verbose paths render an "Incompatible" section when
+# api-rejected plugins exist, and omit the section entirely when there are
+# none (so the happy path stays quiet). Also asserts the wizard/loader
+# filter (scanUserFeeds) continues to hide incompatibles — they're a
+# reporting signal, not a loadable surface.
+incompat_dir="$SANDBOX/cfg-incompat"
+rm -rf "$incompat_dir"
+mkdir -p "$incompat_dir/claude-newsline/feeds"
+
+# Mixed set: one loadable, one explicitly incompatible, one non-numeric
+# (should fall back to v1 and thus be loadable — guards against confusing
+# "non-numeric" with "incompatible" in the renderer).
+cat > "$incompat_dir/claude-newsline/feeds/good.sh" <<'SH'
+FEED_META_good='description=Loadable
+api=1
+category=News'
+feed_good() { LABEL='G'; URL='https://x'; JQ='.'; }
+SH
+cat > "$incompat_dir/claude-newsline/feeds/future.sh" <<'SH'
+FEED_META_future='description=From the year 3000
+api=99
+version=0.5.0'
+feed_future() { LABEL='F'; URL='https://x'; JQ='.'; }
+SH
+
+# Plain --list-feeds: Incompatible section present, plugin listed with
+# declared api and runtime-supported-max.
+out=$(CLAUDE_CONFIG_DIR="$incompat_dir" node "$CLI" --list-feeds 2>&1)
+assert_contains "$out" "Incompatible plugins"       "plain list has Incompatible header"
+assert_contains "$out" "future"                     "incompatible plugin name shown"
+assert_contains "$out" "declares api=99"            "plain list reports declared api"
+assert_contains "$out" "runtime supports up to 2"   "plain list reports runtime max"
+# good.sh must still appear under User feeds (not poisoned by the
+# incompatible sibling).
+assert_contains "$out" "User feeds:"                "User feeds header present"
+assert_contains "$out" "good"                       "loadable plugin still listed"
+
+# Verbose --list-feeds: the Incompatible group header appears once, below
+# all loadable category groups. Plugin rendered with reason + self-
+# reported metadata (description/version) so user can identify the file.
+out=$(CLAUDE_CONFIG_DIR="$incompat_dir" node "$CLI" --list-feeds -v 2>&1)
+assert_contains "$out" "Incompatible"               "verbose list has Incompatible group"
+assert_contains "$out" "From the year 3000"         "-v shows incompatible plugin's description"
+assert_contains "$out" "0.5.0"                       "-v shows incompatible plugin's version"
+assert_contains "$out" "reason"                      "-v shows reason line"
+
+# No-incompat case: remove the future plugin and re-run. The Incompatible
+# section must disappear entirely — rendering an empty header would
+# confuse users who'd wonder what's being hidden.
+rm "$incompat_dir/claude-newsline/feeds/future.sh"
+out=$(CLAUDE_CONFIG_DIR="$incompat_dir" node "$CLI" --list-feeds 2>&1)
+case "$out" in
+  *"Incompatible"*) fail "plain list must not show Incompatible when empty" ;;
+  *)                pass "plain list hides Incompatible section when empty" ;;
+esac
+out=$(CLAUDE_CONFIG_DIR="$incompat_dir" node "$CLI" --list-feeds -v 2>&1)
+case "$out" in
+  *"Incompatible"*) fail "verbose list must not show Incompatible when empty" ;;
+  *)                pass "verbose list hides Incompatible section when empty" ;;
+esac
+
+# scanUserFeeds (loadable-only filter) must STILL exclude incompatibles.
+# The Incompatible section is an inspection-time affordance; the wizard's
+# feeds checkbox should never offer a plugin the runtime will reject.
+cat > "$incompat_dir/claude-newsline/feeds/future.sh" <<'SH'
+FEED_META_future='api=99'
+feed_future() { LABEL='F'; URL='https://x'; JQ='.'; }
+SH
+out=$(node -e "
+  const m = require('$CLI');
+  const loadable = m.scanUserFeeds('$incompat_dir/claude-newsline/feeds').map(f=>f.name).join(',');
+  const all      = m.scanAllUserFeeds('$incompat_dir/claude-newsline/feeds').map(f=>f.name+(f.compat.ok?'':':incompat')).join(',');
+  console.log('loadable='+loadable);
+  console.log('all='+all);
+")
+assert_contains "$out" "loadable=good"              "scanUserFeeds excludes api=99 plugins"
+assert_contains "$out" "future:incompat"            "scanAllUserFeeds tags api=99 as incompat"
+assert_contains "$out" "good"                       "scanAllUserFeeds also includes loadable plugins"
+
+rm -rf "$incompat_dir"
+
+}
+
+section "--list-feeds -v groups plugins by FEED_META category" && {
+# With multiple categories present, -v renders a `[<Category>]` header
+# above each group. Plugins with no category land in "Custom" (user) or
+# "News" (built-in default). Suppresses the `category=` key from the
+# per-plugin detail list since the group header already shows it.
+cat_dir="$SANDBOX/cfg-category"
+rm -rf "$cat_dir"
+mkdir -p "$cat_dir/claude-newsline/feeds"
+
+cat > "$cat_dir/claude-newsline/feeds/weather.sh" <<'SH'
+FEED_META_weather='description=Local forecast
+api=1
+category=Weather'
+feed_weather() { LABEL='W'; URL='https://x'; JQ='.'; }
+SH
+cat > "$cat_dir/claude-newsline/feeds/nocat.sh" <<'SH'
+FEED_META_nocat='description=No category declared
+api=1'
+feed_nocat() { LABEL='N'; URL='https://x'; JQ='.'; }
+SH
+
+out=$(CLAUDE_CONFIG_DIR="$cat_dir" node "$CLI" --list-feeds -v 2>&1)
+assert_contains "$out" "[News]"                      "built-ins group under [News]"
+assert_contains "$out" "[Weather]"                   "declared category renders as header"
+assert_contains "$out" "[Custom]"                    "missing category defaults to [Custom]"
+# The `category=` line must not appear in the per-plugin details — the
+# header already carries the category, and double-printing would be noise.
+case "$out" in
+  *"category     Weather"*) fail "category= key should be suppressed in details" ;;
+  *)                        pass "category= key is elided from per-plugin details" ;;
+esac
+
+rm -rf "$cat_dir"
+
+}
+
+section "--list-feeds surfaces user feeds alongside built-ins" && {
+# Plain list shows built-ins + user feeds; -v/--verbose adds FEED_META
+# fields. A built-in shadowed by a same-named user file is flagged as
+# overridden (matches the runtime's last-definition-wins semantics).
+list_dir="$SANDBOX/cfg-list"
+rm -rf "$list_dir"
+mkdir -p "$list_dir/claude-newsline/feeds"
+
+out=$(CLAUDE_CONFIG_DIR="$list_dir" node "$CLI" --list-feeds 2>&1)
+assert_contains "$out" "Built-in feeds:"             "plain list has built-in header"
+assert_contains "$out" "hn"                          "hn listed"
+assert_contains "$out" "reddit"                      "reddit listed"
+assert_contains "$out" "lobsters"                    "lobsters listed"
+assert_contains "$out" "No user feeds"               "empty-state hint shown"
+assert_contains "$out" "--new-feed"                  "empty-state suggests --new-feed"
+
+cat > "$list_dir/claude-newsline/feeds/nyt.sh" <<'SH'
+FEED_META_nyt='description=New York Times top stories
+version=0.2.0
+author=alice
+homepage=https://nyt.com'
+feed_nyt() { LABEL='NYT'; URL='https://x'; JQ='.'; }
+SH
+cat > "$list_dir/claude-newsline/feeds/hn.sh" <<'SH'
+FEED_META_hn='description=Custom HN override'
+feed_hn() { LABEL='HN'; URL='https://y'; JQ='.'; }
+SH
+# Bad-name file — scanner must skip it (matches sh-side rules).
+cat > "$list_dir/claude-newsline/feeds/2bad.sh" <<'SH'
+feed_2bad() { :; }
+SH
+
+out=$(CLAUDE_CONFIG_DIR="$list_dir" node "$CLI" --list-feeds 2>&1)
+assert_contains "$out" "User feeds:"                 "user feeds section appears"
+assert_contains "$out" "nyt"                         "user feed nyt listed"
+assert_contains "$out" "overridden by user feed"     "built-in hn flagged as overridden"
+case "$out" in
+  *"2bad"*) fail "bad-name user feed should not appear in --list-feeds" ;;
+  *)        pass "bad-name user feed is skipped" ;;
+esac
+
+# Verbose: description/version/author/homepage rendered.
+out=$(CLAUDE_CONFIG_DIR="$list_dir" node "$CLI" --list-feeds -v 2>&1)
+assert_contains "$out" "New York Times top stories"  "-v shows description"
+assert_contains "$out" "0.2.0"                        "-v shows version"
+assert_contains "$out" "alice"                        "-v shows author"
+assert_contains "$out" "https://nyt.com"              "-v shows homepage"
+assert_contains "$out" "Custom HN override"           "-v shows override description"
+out=$(CLAUDE_CONFIG_DIR="$list_dir" node "$CLI" --list-feeds --verbose 2>&1)
+assert_contains "$out" "New York Times top stories"   "--verbose long form works"
+
+rm -rf "$list_dir"
+
+}
+
+section "FEED_META_<name> is surfaced in NEWSLINE_DEBUG=1 report" && {
+# Metadata is parsed only at debug-time (no cost on the hot path), so the
+# round-trip test lives here. Built-in metadata is declared next to the feed
+# functions; the report must show description for each built-in, plus any
+# user-plugin metadata + the auto-attached source=<path>.
+out=$(NEWSLINE_DEBUG=1 bash "$STATUSLINE" </dev/null)
+assert_contains "$out" "feed metadata:" "debug report has metadata section"
+assert_contains "$out" "Hacker News front page" "hn description surfaces"
+assert_contains "$out" "Lobsters hottest links" "lobsters description surfaces"
+assert_contains "$out" "parameterized via NEWSLINE_REDDIT_SUBS" "reddit (parameterized) description surfaces"
+
+# User feed metadata round-trip: author/version plus auto-attached source=.
+user_feeds_dir="$SANDBOX/user-feeds-meta"
+mkdir -p "$user_feeds_dir"
+cat > "$user_feeds_dir/myplugin.sh" <<'SH'
+FEED_META_myplugin='description=A friendly test feed
+version=1.2.3
+author=tester'
+feed_myplugin() {
+  LABEL='Test'
+  URL='https://example.test/x'
+  JQ='.[] | [$default, .title, .url] | @tsv'
+}
+SH
+out=$(NEWSLINE_FEEDS_DIR="$user_feeds_dir" NEWSLINE_DEBUG=1 bash "$STATUSLINE" </dev/null)
+assert_contains "$out" "A friendly test feed" "user plugin description surfaces"
+assert_contains "$out" "1.2.3"                 "user plugin version surfaces"
+assert_contains "$out" "tester"                "user plugin author surfaces"
+assert_contains "$out" "$user_feeds_dir/myplugin.sh" "auto-attached source=<path> points at the user file"
+rm -rf "$user_feeds_dir"
+
+}
 section "re-install with identical flags prints 'Configuration already matches'" && {
 # The noop-detection branch in describePlan exists so a user re-running the
 # wizard and accepting all defaults sees "nothing changed" instead of a
@@ -1373,12 +2780,13 @@ run_uninstall >/dev/null 2>&1
 assert_equals "$(jq 'has("env")' "$SETTINGS")" "false" ".env key deleted when only our keys were in it"
 
 }
-section "uninstall removes installed script, colors.sh, and cache" && {
+section "uninstall removes installed script, colors.sh, xml-to-json.js, and cache" && {
 run_cli >/dev/null 2>&1
 prime_cache "cache cleanup test" "https://example.com/cache"
 run_uninstall >/dev/null 2>&1
 assert_file_absent "$CLAUDE_CONFIG_DIR/claude-newsline.sh" "script deleted"
 assert_file_absent "$CLAUDE_CONFIG_DIR/colors.sh"          "colors.sh deleted"
+assert_file_absent "$CLAUDE_CONFIG_DIR/xml-to-json.js"     "xml-to-json.js deleted"
 assert_file_absent "$CACHE"                                "cache file removed"
 
 }

@@ -24,6 +24,39 @@
 # specific label when the title starts with a known convention (e.g. HN's
 # "Show HN:" / "Ask HN:" / "Tell HN:" prefixes get promoted into the label
 # position so the rendered line doesn't read "HN: Show HN: ...").
+# Feed metadata. Free-form `key=value` lines, parsed only by the debug report
+# (NEWSLINE_DEBUG=1) and the installer's --list-feeds. Not consulted on the
+# hot render path, so adding more keys in the future is free.
+# Recognized keys:
+#   api         — plugin-contract version the file was written against.
+#                 See FEED_API_VERSION below. Absent or non-numeric is
+#                 treated as api=1 for backward compatibility.
+#   category    — grouping label shown in `--list-feeds -v`. Free-form;
+#                 no enforcement. Defaults to "Custom" in the installer
+#                 when absent from a user plugin.
+#   description, version, author, homepage — free-form; surfaced by
+#                 --list-feeds -v. Everything here is informational.
+#   source      — auto-attached at load time for user feeds; built-ins
+#                 set it explicitly to "built-in" so the debug report
+#                 never shows a blank provenance for them.
+# A feed with no FEED_META is still valid — all keys are optional.
+#
+# Plugin-contract version. Bumped when `feed_<name>()` grows a new
+# required global, when FEED_PARAMS semantics change, or when the JQ TSV
+# shape changes. User plugins that declare `api=N` with N > this value
+# are skipped at load time (load_user_feeds). Absent / non-numeric `api`
+# is treated as 1. v2 gates FEED_PARSER support.
+FEED_API_VERSION=2
+# Default jq filter for FEED_PARSER=xml plugins with no JQ declared —
+# keeps the "just give me title + link" case down to three lines of
+# plugin. Leading underscore so a plugin can't accidentally shadow it.
+_FEED_XML_DEFAULT_JQ='.[] | [$default, .title, .link] | @tsv'
+
+# shellcheck disable=SC2034  # Read via eval in describe_feed_meta().
+FEED_META_hn='description=Hacker News front page (top 30)
+api=1
+category=News
+source=built-in'
 feed_hn() {
   LABEL='HN'
   URL='https://hn.algolia.com/api/v1/search?tags=front_page&hitsPerPage=30'
@@ -98,12 +131,22 @@ feed_reddit() {
 # FEED_PARAMS_<name>='INTERNAL'. No dispatch-loop changes needed.
 # shellcheck disable=SC2034  # Referenced indirectly via eval in refresh_all_feeds.
 FEED_PARAMS_reddit='REDDIT_SUBS'
+# shellcheck disable=SC2034  # Read via eval in describe_feed_meta().
+FEED_META_reddit='description=Reddit top posts (parameterized via NEWSLINE_REDDIT_SUBS)
+api=1
+category=News
+source=built-in'
 feed_lobsters() {
   LABEL='Lobsters'
   URL='https://lobste.rs/hottest.json'
   # shellcheck disable=SC2016  # $default is a jq variable, must not expand in shell.
   JQ='.[] | select(.title != null) | [$default, .title, .short_id_url] | @tsv'
 }
+# shellcheck disable=SC2034  # Read via eval in describe_feed_meta().
+FEED_META_lobsters='description=Lobsters hottest links
+api=1
+category=News
+source=built-in'
 ALL_FEEDS='hn reddit lobsters'
 
 # Knobs the debug report inspects — stored with the user-facing NEWSLINE_*
@@ -114,8 +157,7 @@ _DBG_VARS='NEWSLINE_FEEDS_DISABLED NEWSLINE_REDDIT_SUBS NEWSLINE_ROTATION_SEC
   NEWSLINE_REFRESH_SEC NEWSLINE_MAX_TITLE NEWSLINE_COLOR_FEED
   NEWSLINE_COLOR_PREFIX NEWSLINE_PREFIX NEWSLINE_SHOW_LABELS
   NEWSLINE_LABEL_SEP NEWSLINE_HYPERLINKS NEWSLINE_SCROLL NEWSLINE_SCROLL_SEC
-  NEWSLINE_SCROLL_WIDTH NEWSLINE_SCROLL_SEPARATOR NEWSLINE_CACHE_FILE
-  NEWSLINE_CACHE_CHUNK'
+  NEWSLINE_SCROLL_SEPARATOR NEWSLINE_CACHE_FILE NEWSLINE_CACHE_CHUNK'
 
 # Before defaults apply, record which knobs were already set in the environment
 # (shell export, `env -v`, or Claude Code's settings.json → "env"). Used by the
@@ -142,7 +184,14 @@ FEEDS_DISABLED="${NEWSLINE_FEEDS_DISABLED:-}"
 REDDIT_SUBS="${NEWSLINE_REDDIT_SUBS:-programming}"
 ROTATION_SEC="${NEWSLINE_ROTATION_SEC:-20}"
 REFRESH_SEC="${NEWSLINE_REFRESH_SEC:-600}"
-MAX_TITLE="${NEWSLINE_MAX_TITLE:-60}"
+# MAX_TITLE is a BYTE budget, not a column budget — truncate_title uses
+# `head -c` which is byte-based. For ASCII that's 1:1 with columns; for
+# CJK (3 bytes/char, 2 cols/char) a 60-byte limit means ≈36 columns; for
+# emoji-heavy titles it drops lower still. 80 bytes is a compromise: gives
+# ASCII users 80 visible columns (plenty for any modern status line), and
+# gives CJK users ≈48 columns (a readable chunk) without needing a full
+# wcwidth table here. Users pushing longer titles can still crank this.
+MAX_TITLE="${NEWSLINE_MAX_TITLE:-80}"
 CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 CACHE_FILE="${NEWSLINE_CACHE_FILE:-$CONFIG_DIR/cache/feed-titles.txt}"
 
@@ -176,12 +225,12 @@ HYPERLINKS="${NEWSLINE_HYPERLINKS:-auto}"
 # horizontally to the next for SCROLL_SEC seconds. Claude Code refreshes at
 # 1 FPS, so the "scroll" is always a stepped slide — SCROLL_SEC discrete
 # frames, not a smooth glide. NEWSLINE_SCROLL=0 disables the transition
-# (static rotation). NEWSLINE_SCROLL_WIDTH tracks NEWSLINE_MAX_TITLE by
-# default — widen MAX_TITLE and the window follows so long titles don't
-# get clipped mid-slide.
+# (static rotation). The viewport width is derived per-frame from the
+# two headlines being transitioned (see render_scroll_window) — there is
+# no NEWSLINE_SCROLL_WIDTH knob, because a fixed width wide enough to hold
+# the longest title let both titles fit simultaneously and broke the slide.
 SCROLL="${NEWSLINE_SCROLL:-1}"
 SCROLL_SEC="${NEWSLINE_SCROLL_SEC:-5}"
-SCROLL_WIDTH="${NEWSLINE_SCROLL_WIDTH:-$MAX_TITLE}"
 # ==================================
 
 # Coerce a numeric env var to the given default if empty, non-numeric, or
@@ -202,12 +251,8 @@ guard_num() {
 }
 guard_num ROTATION_SEC 20
 guard_num REFRESH_SEC  600
-guard_num MAX_TITLE    60
+guard_num MAX_TITLE    80
 guard_num SCROLL_SEC   5 allow_zero
-# Track MAX_TITLE for the same reason the default in the config block does —
-# a user widening MAX_TITLE shouldn't have their scroll window clip long
-# titles just because they pasted a garbage SCROLL_WIDTH.
-guard_num SCROLL_WIDTH "$MAX_TITLE"
 # Separator rendered between consecutive headlines during the scroll
 # transition — gives the eye a clear boundary when one article leaves and
 # the next enters. Default "  |  " (pipe, padded with two spaces each side).
@@ -264,6 +309,127 @@ _SCRIPT_DIR=$(CDPATH=; cd -- "$(dirname -- "$_script")" && pwd)
 . "$_SCRIPT_DIR/colors.sh"
 
 TAB=$(printf '\t')
+
+# ============= USER FEEDS =============
+# Drop a `<name>.sh` file in $NEWSLINE_FEEDS_DIR (default:
+# $CLAUDE_CONFIG_DIR/claude-newsline/feeds) and it's picked up as a feed.
+# The file must define feed_<name>() which sets LABEL/URL/JQ. Parameterized
+# feeds work exactly like built-ins — declare FEED_PARAMS_<name>='VAR' and
+# set VAR in .env (e.g. NEWSLINE_MYFEED_SRCS → dispatched via FEED_PARAMS).
+#
+# Failure is local: a file that fails to source, doesn't define the expected
+# function, or has a bad name is skipped silently (listed in NEWSLINE_DEBUG=1).
+# A user file `hn.sh` overrides the built-in `feed_hn` via sh's last-definition
+# wins — intended, but not duplicated into ALL_FEEDS (no double rotation slots).
+USER_FEEDS_DIR="${NEWSLINE_FEEDS_DIR:-$CONFIG_DIR/claude-newsline/feeds}"
+# Populated by load_user_feeds(); name<TAB>path pairs used by the debug
+# report. Lazy so the hot path (fresh-cache tick, no refresh queued) doesn't
+# source N shell files per second — feed_<name> functions are only called
+# from refresh_all_feeds, which calls load_user_feeds on entry. The debug
+# branch calls it too so the report reflects what a live refresh would see.
+_USER_FEEDS_MAP=
+# name<TAB>path<TAB>reason per line. Rendered in the debug report so users
+# writing broken plugins get a direct answer instead of wondering why their
+# file isn't rotating. Same three skip paths as scanAllUserFeeds on the JS
+# side: bad filename, source error (syntax / missing feed_<name>), api gate.
+_USER_FEEDS_FAILED=
+_USER_FEEDS_LOADED=0
+load_user_feeds() {
+  # Idempotent: callers may hit both the refresh path and (hypothetically)
+  # debug in the same process — re-sourcing would just double-append to
+  # _USER_FEEDS_MAP. Guard once.
+  [ "$_USER_FEEDS_LOADED" = "1" ] && return 0
+  _USER_FEEDS_LOADED=1
+  [ -d "$USER_FEEDS_DIR" ] || return 0
+  for _ufeed in "$USER_FEEDS_DIR"/*.sh; do
+    # Unglobbed literal when the dir is empty — guard with `-f`.
+    [ -f "$_ufeed" ] || continue
+    _uname=${_ufeed##*/}; _uname=${_uname%.sh}
+    # Filename must map to a legal sh function name. POSIX: [A-Za-z_][A-Za-z0-9_]*.
+    # Rejects "2fa.sh" (leading digit) and "my-feed.sh" (hyphen) before
+    # producing an uncallable `feed_my-feed` function name.
+    case "$_uname" in
+      ''|[!A-Za-z_]*|*[!A-Za-z0-9_]*)
+        _USER_FEEDS_FAILED="${_USER_FEEDS_FAILED}${_uname}${TAB}${_ufeed}${TAB}bad filename (must match [A-Za-z_][A-Za-z0-9_]*)
+"
+        continue ;;
+    esac
+    # Capture source errors to a per-plugin tempfile so the debug report can
+    # surface WHY a file failed (syntax error, unset variable under -u, …)
+    # without polluting the hot path's stderr. mktemp fallback: if /tmp
+    # isn't writable, we degrade to "source failure, no details" — better
+    # than aborting load for the other plugins.
+    _src_err=$(mktemp "${TMPDIR:-/tmp}/newsline-plugin-err.XXXXXX" 2>/dev/null || echo '')
+    # shellcheck source=/dev/null
+    if [ -n "$_src_err" ]; then
+      . "$_ufeed" 2>"$_src_err"; _src_rc=$?
+    else
+      . "$_ufeed" 2>/dev/null; _src_rc=$?
+    fi
+    if [ "$_src_rc" -ne 0 ] || ! command -v "feed_$_uname" >/dev/null 2>&1; then
+      if [ "$_src_rc" -ne 0 ]; then
+        _reason="source failed (exit $_src_rc)"
+        if [ -n "$_src_err" ] && [ -s "$_src_err" ]; then
+          # First line of stderr is usually the most specific diagnostic;
+          # keeping it short avoids wrapping the debug report layout.
+          _first_err=$(head -1 "$_src_err" 2>/dev/null)
+          [ -n "$_first_err" ] && _reason="$_reason: $_first_err"
+        fi
+      else
+        _reason="feed_$_uname function not defined"
+      fi
+      _USER_FEEDS_FAILED="${_USER_FEEDS_FAILED}${_uname}${TAB}${_ufeed}${TAB}${_reason}
+"
+      [ -n "$_src_err" ] && rm -f "$_src_err"
+      continue
+    fi
+    [ -n "$_src_err" ] && rm -f "$_src_err"
+    # Plugin-contract version gate. A plugin declaring `api=N` with N >
+    # FEED_API_VERSION was written against a contract this runtime doesn't
+    # know how to honor (e.g. a global we don't read, or a JQ TSV shape
+    # we don't parse). Skip it rather than silently mis-calling. Missing
+    # or non-numeric `api` is treated as 1 for backward compat so plugins
+    # written before this gate existed still load. Sourcing has already
+    # happened — benign because the plugin only sets globals and a
+    # function; we just don't append to ALL_FEEDS, so nothing calls it.
+    eval "_meta=\${FEED_META_$_uname:-}"
+    # Pull `api=<N>` out of the metadata block. First match wins; newline-
+    # oriented so it doesn't trip over `api` appearing in a description.
+    _plugin_api=$(printf '%s' "$_meta" | awk -F= '$1=="api" { print $2; exit }')
+    case "$_plugin_api" in
+      ''|*[!0-9]*) : ;; # absent / non-numeric → implicit v1
+      *)
+        if [ "$_plugin_api" -gt "$FEED_API_VERSION" ]; then
+          _USER_FEEDS_FAILED="${_USER_FEEDS_FAILED}${_uname}${TAB}${_ufeed}${TAB}api=$_plugin_api > runtime $FEED_API_VERSION (upgrade claude-newsline)
+"
+          continue
+        fi
+        ;;
+    esac
+    # Dedupe: a user file named hn.sh overrides the built-in function
+    # (source replaces it) but must not double-append to ALL_FEEDS or
+    # the dispatch loop fetches it twice per refresh.
+    case " $ALL_FEEDS " in
+      *" $_uname "*) : ;;
+      *) ALL_FEEDS="$ALL_FEEDS $_uname" ;;
+    esac
+    # Auto-attach source=<path> to a user-feed's FEED_META so the debug
+    # report can show "where does this feed come from" without the author
+    # having to restate the path. If the user set `source=` themselves,
+    # we append ours as an extra line — last-wins in the line-oriented
+    # parser, so the user's declaration still takes precedence.
+    eval "_meta_cur=\${FEED_META_$_uname:-}"
+    if [ -n "$_meta_cur" ]; then
+      eval "FEED_META_$_uname=\"\$_meta_cur
+source=\$_ufeed\""
+    else
+      eval "FEED_META_$_uname=\"source=\$_ufeed\""
+    fi
+    _USER_FEEDS_MAP="${_USER_FEEDS_MAP}${_uname}${TAB}${_ufeed}
+"
+  done
+}
+# ======================================
 
 # BSD (stat -f %m) and GNU (stat -c %Y) disagree on the flag for %epoch-modified.
 # GNU goes first: on BSD, `-c` is unknown → stderr-only → clean nonzero → fallback
@@ -333,19 +499,63 @@ parse_line() {
   fi
 }
 
-# Shared fetch pipeline — reads LABEL, URL, JQ from the caller's scope.
-# Extracted so the reddit multi-sub loop and the single-feed path share one
-# curl|jq|tr|awk stage. Pipeline: fetch → jq emits <label>\t<title>\t<url>
-# (feed may promote a more specific label; $default is the fallback) →
-# strip C0 control bytes (defense in depth: a compromised feed must not
-# smuggle ESC sequences that would escape from inside our OSC 8 wrapper
-# and hijack the terminal — keep \t=0x09 and \n=0x0A, our separators) →
-# drop empties. Caller redirects stdout to the refresh tempfile.
+# Parser stage — reads FEED_PARSER/LABEL/JQ from the caller's scope. For
+# FEED_PARSER=xml, xml-to-json transforms the body into a JSON array of
+# {title, link, description} and jq runs over that; otherwise jq runs on
+# the raw body directly (JSON feeds). Both branches emit the same
+# label<TAB>title<TAB>url TSV shape so downstream (tr, awk, bucket
+# interleave, parse_line) stays format-agnostic.
+#
+# XML feeds without a JQ filter fall back to _FEED_XML_DEFAULT_JQ — the
+# "just give me title + link" case. Plugins wanting filtering, rewrites,
+# or label promotion override JQ themselves.
+#
+# Stderr is intentionally NOT redirected here: _fetch_one pipes through
+# `2>/dev/null` so refresh-time noise is hidden, while _test_one_invocation
+# captures stderr to a file so parser diagnostics surface in --test-feed.
+#
+# Missing xml-to-json.js degrades to "empty output" for xml feeds (not a
+# crash, not a cryptic `node: cannot open file`) — matches the behavior of
+# a failed curl, so the cache keeps the last good line. The debug branch
+# surfaces this separately so users know WHY an xml feed went silent. Can
+# happen when someone copies statusline.sh alone into a dotfiles repo
+# without the sibling JS shim.
+_parse_body() {
+  case "${FEED_PARSER:-jq}" in
+    xml)
+      if [ ! -f "$_SCRIPT_DIR/xml-to-json.js" ]; then
+        printf 'xml-to-json.js not found alongside statusline.sh; xml feed skipped\n' >&2
+        return 0
+      fi
+      node "$_SCRIPT_DIR/xml-to-json.js" \
+        | jq -r --arg default "$LABEL" "${JQ:-$_FEED_XML_DEFAULT_JQ}" ;;
+    *)   jq -r --arg default "$LABEL" "$JQ" ;;
+  esac
+}
+
+# Shared fetch pipeline — reads LABEL, URL, JQ, FEED_PARSER from the
+# caller's scope. Extracted so the reddit multi-sub loop and the single-
+# feed path share one curl|parse|tr|awk stage. Pipeline: fetch →
+# _parse_body emits <label>\t<title>\t<url> (feed may promote a more
+# specific label; $default is the fallback the plugin's jq sees; XML
+# feeds first pass through xml-to-json before jq runs) → strip C0 control
+# bytes (defense in depth: a compromised feed must not smuggle ESC
+# sequences that would
+# escape from inside our OSC 8 wrapper and hijack the terminal — keep
+# \t=0x09 and \n=0x0A, our separators) → drop empties. Caller redirects
+# stdout to the refresh tempfile.
 _fetch_one() {
-  curl -fsS --connect-timeout 2 --max-time 5 \
+  # -L follows 3xx: without it, a single 301 silently empties a bucket for
+  # a full refresh cycle the moment any feed migrates endpoints.
+  # --retry 1 covers curl's default transient set (408/429/5xx/connect
+  # errors). Reddit in particular 429s anonymous clients — without the
+  # retry, one 429 blanks a bucket for 10 minutes. --max-time 8 is the
+  # TOTAL budget; it already covers the retry + retry-delay.
+  curl -fs -L --compressed --retry 1 --retry-delay 1 \
+      --connect-timeout 2 --max-time 8 \
       -A "${NEWSLINE_USER_AGENT:-claude-newsline/1.0 (+https://github.com/sitapix/claude-newsline)}" \
       "$URL" 2>/dev/null \
-    | jq -r --arg default "$LABEL" "$JQ" 2>/dev/null \
+    | _parse_body 2>/dev/null \
     | LC_ALL=C tr -d '\000-\010\013-\037\177' \
     | awk 'NF'
 }
@@ -363,13 +573,21 @@ _fetch_one() {
 # time into the real cache. Naive append would play all of HN's 30 titles
 # before showing a single Reddit or Lobsters entry — with ROTATION_SEC=20
 # that's 10 minutes of HN before the rotation ever visits another source.
-# Chunked interleave caps the "stuck on one feed" window at CACHE_CHUNK ticks.
+# Default CACHE_CHUNK=1 gives strict round-robin (HN, Reddit, Lobsters, HN,
+# Reddit, Lobsters, …) so the "stuck on one feed" window is at most one
+# rotation tick. Higher values cluster same-source entries together — some
+# users prefer that; bump via NEWSLINE_CACHE_CHUNK if so.
 #
 # Forks are safe because LABEL/URL/JQ are copied into each child at fork time
 # — the parent loop can reassign them for the next iteration without racing
-# the already-running children. Parallelism keeps worst-case refresh far under
-# the 120s stale-lock reaper even as MAX_REDDIT_SUBS grows.
+# the already-running children. Parallelism means worst-case refresh is
+# bounded by the SLOWEST single fetch (curl --max-time 5) plus jq/awk
+# overhead — not the SUM of all fetches. Empirical: 7 parallel fetches
+# complete in <1s on a warm connection. Used by STALE_REAP_SEC below.
 refresh_all_feeds() {
+  # User feeds are sourced lazily here (not at script startup) so fresh-cache
+  # ticks that skip refresh don't pay the per-file source cost.
+  load_user_feeds
   tmp="$CACHE_FILE.new.$$"
   buckets="$CACHE_FILE.buckets.$$"
   mkdir -p "$buckets" 2>/dev/null
@@ -394,11 +612,17 @@ refresh_all_feeds() {
       set -- $_params_val
       IFS=$_old_ifs
       for _p in "$@"; do
+        # Reset FEED_PARSER before each call so a v2 plugin that sets it
+        # doesn't leak into the next iteration's JSON feed. LABEL/URL/JQ
+        # are set unconditionally by every feed function, so only
+        # FEED_PARSER (optional, v2+) needs an explicit reset.
+        FEED_PARSER=
         if "feed_$f" "$_p"; then
           _capture_bucket
         fi
       done
     else
+      FEED_PARSER=
       "feed_$f"
       _capture_bucket
     fi
@@ -410,7 +634,7 @@ refresh_all_feeds() {
   # inner bounds check drops exhausted buckets so remaining buckets aren't
   # clumped at the tail.
   if [ "$_bucket_idx" -gt 0 ]; then
-    awk -v chunk="${NEWSLINE_CACHE_CHUNK:-3}" '
+    awk -v chunk="${NEWSLINE_CACHE_CHUNK:-1}" '
       FNR == 1 { fi++ }
       { lines[fi, lc[fi]++] = $0 }
       END {
@@ -425,42 +649,82 @@ refresh_all_feeds() {
   fi
   rm -rf "$buckets"
   if [ -s "$tmp" ]; then
-    mv "$tmp" "$CACHE_FILE"
+    # Double-buffer: if a cache is already populated, stage the fresh data
+    # in a .pending sibling and let the next pos_in_cycle=0 tick promote
+    # it. This way the displayed headline never swaps mid-dwell or mid-
+    # scroll — a refresh that lands on pos=10 of a 20s rotation won't
+    # suddenly show a different title; it waits until the cycle boundary.
+    # First-ever fill bypasses .pending so users don't stare at an empty
+    # status line until the first rotation completes.
+    if [ -s "$CACHE_FILE" ]; then
+      mv "$tmp" "$CACHE_FILE.pending"
+    else
+      mv "$tmp" "$CACHE_FILE"
+    fi
   else
     rm -f "$tmp"
   fi
 }
 
 # Render the horizontal-scroll transition between two composed headlines.
-# The tape is `a + SCROLL_SEPARATOR + b` — offset sweeps 0..(len(a)+len(sep))
-# over SCROLL_SEC frames, so offset=0 shows the start of the window (a
-# leading) and the end-offset shows b starting at window column 0. The
-# visible separator between consecutive headlines is fixed-width regardless
-# of title length (prior impl padded each side to SCROLL_WIDTH, which
-# produced a huge dead zone for short titles). No OSC 8 is emitted during
-# scroll: the window rarely corresponds to a single URL.
-# Reads pos_in_cycle, dwell, SCROLL_SEC, SCROLL_WIDTH, SCROLL_SEPARATOR,
-# c_feed, RESET from the enclosing scope.
+# The tape is `a_padded + SCROLL_SEPARATOR + b_padded`, where each title is
+# right-padded to max(len(a), len(b)). The viewport width matches that same
+# max and is constant across every frame — trailing spaces on the terminal
+# bg are invisible, so padding b costs nothing visually but keeps the line
+# width from collapsing when we reach the final (b-only) frame.
+#
+# OFFSET MATH — trace it before tweaking:
+#
+#   slide  = w + ls            (travel distance: start of a to start of b)
+#   offset = round((frame+1) * slide / SCROLL_SEC)   for frame ∈ [0, S-1]
+#
+# Every scroll frame is a motion step: frame 0 shows slide/S progress (no
+# duplicate-of-dwell frame), frame S-1 lands exactly at `slide` (b at
+# viewport position 1). Gives S approximately-even motion steps instead of
+# S-1 larger ones, so the landing doesn't feel disproportionate.
+#
+# No OSC 8 emitted during scroll — the window rarely maps to a single URL.
+# Reads pos_in_cycle, dwell, SCROLL_SEC, SCROLL_SEPARATOR, c_prefix, c_feed,
+# PREFIX, RESET from the enclosing scope.
 render_scroll_window() {
   _rs_cur=$1
   _rs_nxt=$2
   _rs_frame=$(( pos_in_cycle - dwell ))
-  _rs_slide=$(( ${#_rs_cur} + ${#SCROLL_SEPARATOR} ))
-  if [ "$SCROLL_SEC" -le 1 ]; then
-    _rs_offset=$_rs_slide
-  else
-    _rs_offset=$(( _rs_frame * _rs_slide / (SCROLL_SEC - 1) ))
-  fi
   # BSD awk substr() is byte-based, so a slice can bisect a multi-byte
   # codepoint and render as U+FFFD. Pipe through `iconv -c` in the same
   # subshell to drop the orphan bytes — fork-free vs the prior capture-
   # then-re-pipe pattern.
-  _rs_window=$(awk -v a="$_rs_cur" -v b="$_rs_nxt" \
-                   -v sep="$SCROLL_SEPARATOR" -v w="$SCROLL_WIDTH" -v o="$_rs_offset" '
+  #
+  # Pass untrusted strings (titles, separator) via ENVIRON[] rather than
+  # awk -v. POSIX/gawk/mawk/BSD awk all expand C-style backslash escapes
+  # (\033, \n, \xHH, \ddd) in -v values — so a feed whose title contained
+  # the four text bytes "\033" would get ESC (0x1B) injected here, past
+  # the C0/C1 strip in _fetch_one (that strip only removes raw control
+  # bytes, not their \ddd text encoding). ENVIRON[] reads the env verbatim
+  # with no escape processing, closing the ANSI-injection path while
+  # keeping the numeric -v assignments (frame/scroll_sec) — those come
+  # from internal integer arithmetic and need no escaping.
+  _rs_window=$(_RS_A="$_rs_cur" _RS_B="$_rs_nxt" _RS_SEP="$SCROLL_SEPARATOR" \
+               awk -v frame="$_rs_frame" -v scroll_sec="$SCROLL_SEC" '
     BEGIN {
+      a = ENVIRON["_RS_A"]; b = ENVIRON["_RS_B"]; sep = ENVIRON["_RS_SEP"]
+      la = length(a); lb = length(b); ls = length(sep)
+      w = (la > lb) ? la : lb
+      # Pad BOTH titles to w so the viewport returns exactly w chars at every
+      # offset. Padding only `a` (an earlier attempt) left the final frame
+      # returning just `len(b)` chars when b was shorter — the visible line
+      # collapsed on the last step of the slide, reading as a disproportionate
+      # "jump" onto the dwell spot. Trailing spaces on the terminal bg are
+      # invisible, so padding b is free visually but keeps motion uniform.
+      if (w > la) a = a sprintf("%*s", w - la, "")
+      if (w > lb) b = b sprintf("%*s", w - lb, "")
       combined = a sep b
-      if (length(combined) < w) combined = sprintf("%-*s", w, combined)
-      print substr(combined, o + 1, w)
+      slide = w + ls
+      # + 0.5 rounds instead of floors — spreads the truncation error
+      # evenly across frames so step sizes read as 10,10,10,10,9 rather
+      # than 9,10,10,10,10. Caller guarantees scroll_sec >= 1.
+      offset = int((frame + 1) * slide / scroll_sec + 0.5)
+      print substr(combined, offset + 1, w)
     }
   ' | iconv -f UTF-8 -t UTF-8 -c 2>/dev/null)
   # PREFIX sits outside the scroll window so it reads as a fixed brand
@@ -520,12 +784,11 @@ if [ "${NEWSLINE_DEBUG:-0}" = "1" ]; then
   echo
   echo 'config (env > .env > default):'
   _dbg_show NEWSLINE_ROTATION_SEC     "$ROTATION_SEC"
-  _dbg_show NEWSLINE_CACHE_CHUNK      "${NEWSLINE_CACHE_CHUNK:-3}"
+  _dbg_show NEWSLINE_CACHE_CHUNK      "${NEWSLINE_CACHE_CHUNK:-1}"
   _dbg_show NEWSLINE_REFRESH_SEC      "$REFRESH_SEC"
   _dbg_show NEWSLINE_MAX_TITLE        "$MAX_TITLE"
   _dbg_show NEWSLINE_SCROLL           "$SCROLL"
   _dbg_show NEWSLINE_SCROLL_SEC       "$SCROLL_SEC"
-  _dbg_show NEWSLINE_SCROLL_WIDTH     "$SCROLL_WIDTH"
   _dbg_show NEWSLINE_SCROLL_SEPARATOR "\"$SCROLL_SEPARATOR\""
   _dbg_show NEWSLINE_PREFIX           "\"$PREFIX\""
   _dbg_show NEWSLINE_COLOR_PREFIX     "$COLOR_PREFIX"
@@ -535,41 +798,374 @@ if [ "${NEWSLINE_DEBUG:-0}" = "1" ]; then
   _dbg_show NEWSLINE_FEEDS_DISABLED   "$FEEDS_DISABLED"
   _dbg_show NEWSLINE_REDDIT_SUBS      "$REDDIT_SUBS"
   _dbg_show NEWSLINE_HYPERLINKS       "$HYPERLINKS"
+  # Debug mode reports what a live refresh would see, so load user feeds
+  # now (the refresh path also calls this; load_user_feeds is idempotent).
+  load_user_feeds
   echo
   _dbg_enabled=
   for f in $ALL_FEEDS; do
     is_disabled "$f" || _dbg_enabled="$_dbg_enabled $f"
   done
   echo "feeds enabled:$_dbg_enabled"
+
+  # Per-feed metadata dump. Pulls FEED_META_<name> for every feed in
+  # ALL_FEEDS (built-ins + user feeds loaded above) and renders whichever
+  # keys are present. A feed without metadata just renders its name — no
+  # metadata is a valid plugin shape. Parser is newline-oriented so one
+  # `key=value` per line; embedded '=' in value survives because we stop
+  # at the first '='.
+  echo
+  echo 'feed metadata:'
+  for _mf in $ALL_FEEDS; do
+    eval "_mval=\${FEED_META_$_mf:-}"
+    if [ -z "$_mval" ]; then
+      printf '  %s\n' "$_mf"
+      continue
+    fi
+    printf '  %s\n' "$_mf"
+    # Read line-by-line; `IFS=` preserves leading whitespace in descriptions.
+    # Splitting on first '=' via parameter expansion avoids an awk fork per
+    # key — debug is a one-shot but we keep the same "no gratuitous forks"
+    # discipline as the hot path.
+    printf '%s\n' "$_mval" | while IFS= read -r _line; do
+      [ -n "$_line" ] || continue
+      case "$_line" in
+        *=*)
+          _k=${_line%%=*}
+          _v=${_line#*=}
+          printf '    %-12s %s\n' "$_k" "$_v"
+          ;;
+      esac
+    done
+  done
+
+  # User feeds: show the name → source-file map so "why isn't my feed
+  # loading?" has a direct answer. Empty block when nothing's in the dir;
+  # the "(none)" path tells the user the directory was checked.
+  echo
+  echo "user feeds dir:   $USER_FEEDS_DIR"
+  if [ -n "$_USER_FEEDS_MAP" ]; then
+    # Literal ← (U+2190) instead of printf \u2190 — bash 3.2 (ships with
+    # macOS) and dash don't interpret \u escapes, they'd print the literal
+    # backslash-u-digits. The source is UTF-8; the byte sequence renders.
+    printf '%s' "$_USER_FEEDS_MAP" | while IFS="$TAB" read -r _n _p; do
+      [ -n "$_n" ] || continue
+      printf '  %-12s ← %s\n' "$_n" "$_p"
+    done
+  else
+    echo '  (none loaded)'
+  fi
+
+  # Failed plugins: render name, path, and reason so authors of broken
+  # plugins get a direct diagnostic. Without this block, a syntax error in
+  # a user plugin looked identical to "I never dropped the file in" —
+  # hours of confusion for a missing semicolon.
+  if [ -n "$_USER_FEEDS_FAILED" ]; then
+    echo
+    echo 'user feeds skipped:'
+    printf '%s' "$_USER_FEEDS_FAILED" | while IFS="$TAB" read -r _n _p _r; do
+      [ -n "$_n" ] || continue
+      printf '  %-12s %s\n' "$_n" "$_p"
+      printf '  %-12s   reason: %s\n' '' "$_r"
+    done
+  fi
+
+  # xml-to-json.js presence check. FEED_PARSER=xml plugins depend on this
+  # sibling Node shim; someone who copied statusline.sh alone into a
+  # dotfiles repo without it will see xml feeds silently return empty.
+  # Surface here so "why is my RSS feed not working?" has a direct answer.
+  echo
+  if [ -f "$_SCRIPT_DIR/xml-to-json.js" ]; then
+    echo "xml-to-json.js:   $_SCRIPT_DIR/xml-to-json.js"
+  else
+    echo "xml-to-json.js:   MISSING ($_SCRIPT_DIR/xml-to-json.js) — FEED_PARSER=xml plugins will be skipped"
+  fi
+
+  # NEWSLINE_SCROLL_WIDTH deprecation notice. The knob was removed when
+  # render_scroll_window started deriving its width per-frame from the two
+  # titles being transitioned (see comment there). A user with the variable
+  # pinned in .env or settings.json would otherwise get no signal that their
+  # override stopped doing anything.
+  if [ -n "${NEWSLINE_SCROLL_WIDTH:-}" ]; then
+    echo
+    echo 'deprecated:'
+    printf '  %-24s %s\n' 'NEWSLINE_SCROLL_WIDTH' "set to \"$NEWSLINE_SCROLL_WIDTH\" but ignored (auto-derived from title lengths since v0.2.0)"
+  fi
   exit 0
+fi
+
+# NEWSLINE_TEST_FEED=<name> → run one fetch for a single feed and print
+# diagnostics (URL, HTTP code, byte count, jq row count, first few sample
+# rows, URL-scheme warning). Bypasses the cache, lock, and render path so
+# a user authoring a custom feed can see whether their URL + jq filter
+# produce usable rows without waiting for a cache refresh window.
+#
+# Driven by `claude-newsline --test-feed <name>`. Exit codes: 0 on success,
+# 1 on runtime failure (HTTP/jq/empty), 2 on bad input.
+if [ -n "${NEWSLINE_TEST_FEED:-}" ]; then
+  load_user_feeds
+  _tfeed="$NEWSLINE_TEST_FEED"
+
+  # Name validation mirrors load_user_feeds: POSIX function-name rules. A
+  # caller-typed name could contain shell metacharacters if the Node side
+  # didn't filter, so defend in depth before we ever reach `feed_$name`.
+  case "$_tfeed" in
+    ''|[!A-Za-z_]*|*[!A-Za-z0-9_]*)
+      printf 'claude-newsline: invalid feed name: %s\n' "$_tfeed" >&2
+      exit 2
+      ;;
+  esac
+  if ! command -v "feed_$_tfeed" >/dev/null 2>&1; then
+    printf 'claude-newsline: unknown feed: %s\n' "$_tfeed" >&2
+    printf 'available:%s\n' "$(printf ' %s' $ALL_FEEDS)" >&2
+    exit 2
+  fi
+
+  # Local color names (don't collide with c_feed / c_prefix set below). These
+  # respect NO_COLOR/FORCE_COLOR via set_ansi already loaded from colors.sh.
+  set_ansi _tc_ok    green
+  set_ansi _tc_warn  yellow
+  set_ansi _tc_fail  red
+  set_ansi _tc_dim   dim
+
+  # Run one (LABEL, URL, JQ) invocation end-to-end with diagnostics. Returns
+  # 0 on success (≥1 row produced), 1 on any failure. Reads the three feed
+  # globals from caller scope — same contract as _fetch_one. When
+  # NEWSLINE_TEST_FEED_FIXTURE is set, skip curl entirely and use the file
+  # as the response body — lets authors iterate on jq filters without
+  # hammering the real API (or waiting on rate-limited reddit).
+  _test_one_invocation() {
+    _to_header=${1:-}
+    if [ -n "$_to_header" ]; then
+      printf '\n%s%s%s\n' "$_tc_dim" "$_to_header" "$RESET"
+    fi
+    printf '  URL:      %s\n' "$URL"
+
+    _to_body=$(mktemp "${TMPDIR:-/tmp}/newsline-test.XXXXXX") || return 1
+    if [ -n "${NEWSLINE_TEST_FEED_FIXTURE:-}" ]; then
+      # Fixture mode: pipe the local file in place of curl's output. Only
+      # exercised via `claude-newsline --test-feed <name> --fixture <path>`,
+      # which validates the path in Node before we ever get here — so a
+      # missing or unreadable file at this point is a real error (e.g. the
+      # file was unlinked between Node's stat and now), not a user typo.
+      # shellcheck disable=SC2154  # _tc_fail/_tc_ok assigned via set_ansi above; shellcheck can't see through it.
+      if ! cp "$NEWSLINE_TEST_FEED_FIXTURE" "$_to_body" 2>/dev/null; then
+        printf '  %sfixture:  failed to read %s%s\n' "$_tc_fail" "$NEWSLINE_TEST_FEED_FIXTURE" "$RESET"
+        rm -f "$_to_body"
+        return 1
+      fi
+      _to_size=$(wc -c <"$_to_body" | tr -d ' ')
+      # shellcheck disable=SC2154  # _tc_ok set via set_ansi above.
+      printf '  Fixture:  %s%s%s  (%s bytes, no network)\n' \
+        "$_tc_ok" "$NEWSLINE_TEST_FEED_FIXTURE" "$RESET" "$_to_size"
+    else
+      # -w emits meta as "http_code|size_download|time_total" on stdout; -o
+      # writes the body to our tempfile so we can feed it to jq AND read meta
+      # independently. -fS makes curl report non-2xx via exit code; we want to
+      # SEE the HTTP code even on 4xx/5xx so the user knows what happened,
+      # hence bare -sS (no -f) plus an explicit code check below.
+      _to_meta=$(curl -sS -L --compressed --retry 1 --retry-delay 1 \
+                      --connect-timeout 2 --max-time 8 \
+                      -A "${NEWSLINE_USER_AGENT:-claude-newsline/1.0 (+https://github.com/sitapix/claude-newsline)}" \
+                      -w '%{http_code}|%{size_download}|%{time_total}' \
+                      -o "$_to_body" "$URL" 2>&1)
+      _to_curl=$?
+      if [ "$_to_curl" -ne 0 ]; then
+        printf '  HTTP:     %scurl error %d%s\n            %s\n' "$_tc_fail" "$_to_curl" "$RESET" "$_to_meta"
+        rm -f "$_to_body"
+        return 1
+      fi
+      _to_code=${_to_meta%%|*}
+      _to_rest=${_to_meta#*|}
+      _to_size=${_to_rest%%|*}
+      _to_time=${_to_rest#*|}
+      case "$_to_code" in
+        2*) _to_code_color=$_tc_ok ;;
+        *)  _to_code_color=$_tc_fail ;;
+      esac
+      printf '  HTTP:     %s%s%s  (%ss, %s bytes)\n' \
+        "$_to_code_color" "$_to_code" "$RESET" "$_to_time" "$_to_size"
+    fi
+
+    _to_errfile=$(mktemp "${TMPDIR:-/tmp}/newsline-test-err.XXXXXX") || {
+      rm -f "$_to_body"; return 1;
+    }
+    # Same C0/C1 stripping pipeline as _fetch_one, so what the user sees
+    # here is exactly what would hit the cache. The parser stage routes to
+    # jq (default) or xml-to-json|jq (FEED_PARSER=xml) identically to refresh.
+    _to_parser="${FEED_PARSER:-jq}"
+    _to_rows=$(_parse_body <"$_to_body" 2>"$_to_errfile" \
+               | LC_ALL=C tr -d '\000-\010\013-\037\177' \
+               | awk 'NF')
+    rm -f "$_to_body"
+    if [ -s "$_to_errfile" ]; then
+      printf '  %s:       %serror%s\n' "$_to_parser" "$_tc_fail" "$RESET"
+      sed 's/^/            /' "$_to_errfile"
+      rm -f "$_to_errfile"
+      return 1
+    fi
+    rm -f "$_to_errfile"
+
+    if [ -z "$_to_rows" ]; then
+      printf '  %s:       %s0 rows%s (feed produced nothing usable)\n' "$_to_parser" "$_tc_fail" "$RESET"
+      return 1
+    fi
+    _to_count=$(printf '%s\n' "$_to_rows" | awk 'END { print NR }')
+    printf '  %s:       %s%d rows%s\n' "$_to_parser" "$_tc_ok" "$_to_count" "$RESET"
+    printf '  Sample:\n'
+    printf '%s\n' "$_to_rows" | head -3 | while IFS="$TAB" read -r _sl _st _su; do
+      # Literal U+2022 (•) and U+2192 (→) — bash 3.2 / dash don't do \uXXXX
+      # escapes, and the file is already UTF-8 elsewhere (← in the debug
+      # report). Matches the style statusline.sh uses for its render output.
+      printf '    %s • %s → %s\n' "$_sl" "$_st" "$_su"
+    done
+
+    # URL-scheme check: any row whose URL isn't http(s) will render without
+    # the OSC 8 hyperlink (per the scheme guard below). Surfacing it here
+    # means users notice the drift while authoring, not after they push.
+    _to_bad=$(printf '%s\n' "$_to_rows" | awk -F'\t' '
+      $3 !~ /^https?:\/\// { print $3; exit }
+    ')
+    if [ -n "$_to_bad" ]; then
+      printf '  %s⚠ URL scheme not http(s):%s %s\n' "$_tc_warn" "$RESET" "$_to_bad"
+      printf '            OSC 8 hyperlink will be dropped; headline still renders.\n'
+    fi
+    return 0
+  }
+
+  # Dispatch: parameterized feeds loop over FEED_PARAMS_<name>'s CSV. The
+  # feed function is called per entry — if it `return 1`s an invalid entry,
+  # we count that as a failure for this test (same contract as the runtime
+  # refresh, just surfaced). An empty parameter variable is a hard fail —
+  # nothing to exercise.
+  # Header stays uncolored so shell-test assertions can match the whole
+  # "Testing feed: <name>" string as one literal — color escapes between
+  # the label and the name would break `grep -F 'Testing feed: foo'`.
+  printf 'Testing feed: %s' "$_tfeed"
+  eval "_t_params_var=\${FEED_PARAMS_$_tfeed:-}"
+  if [ -n "$_t_params_var" ]; then
+    eval "_t_params_val=\${$_t_params_var:-}"
+    printf ' %s(parameterized via %s="%s")%s\n' "$_tc_dim" "$_t_params_var" "$_t_params_val" "$RESET"
+    _t_ok=0; _t_fail=0
+    _old_ifs=$IFS
+    IFS=','
+    # shellcheck disable=SC2086
+    set -- $_t_params_val
+    IFS=$_old_ifs
+    _t_total=$#
+    if [ "$_t_total" -eq 0 ]; then
+      # Most common cause: user set NEWSLINE_<INTERNAL> in their settings.json
+      # but their plugin file has no `INTERNAL="${NEWSLINE_INTERNAL:-}"` line,
+      # so the dispatch loop's `$INTERNAL` lookup comes back empty. Guide
+      # them toward the three possible fixes so they don't have to chase
+      # the convention through docs.
+      printf '\n%s✗ Parameter variable %s is empty — no entries to test.%s\n' "$_tc_fail" "$_t_params_var" "$RESET"
+      printf '\n'
+      printf '  To fix, pick one:\n'
+      printf '\n'
+      printf '    1. Set NEWSLINE_%s in your env or settings.json, AND make sure\n' "$_t_params_var"
+      printf '       your plugin file contains this binding line:\n'
+      printf '         %s="${NEWSLINE_%s:-}"\n' "$_t_params_var" "$_t_params_var"
+      printf '       (without it, NEWSLINE_%s is read by nothing.)\n' "$_t_params_var"
+      printf '\n'
+      printf '    2. Test with a one-off override:\n'
+      printf '         NEWSLINE_%s=value1,value2 claude-newsline --test-feed %s\n' "$_t_params_var" "$_tfeed"
+      printf '\n'
+      printf '    3. Give FEED_PARAMS_%s a sensible default in your plugin:\n' "$_tfeed"
+      printf '         %s="${NEWSLINE_%s:-default-entry}"\n' "$_t_params_var" "$_t_params_var"
+      exit 1
+    fi
+    _t_idx=0
+    for _t_p in "$@"; do
+      _t_idx=$((_t_idx + 1))
+      FEED_PARSER=
+      if "feed_$_tfeed" "$_t_p"; then
+        if _test_one_invocation "[$_t_idx/$_t_total] $LABEL"; then
+          _t_ok=$((_t_ok + 1))
+        else
+          _t_fail=$((_t_fail + 1))
+        fi
+      else
+        printf '\n  %s✗ entry rejected by feed_%s:%s %s\n' "$_tc_fail" "$_tfeed" "$RESET" "$_t_p"
+        _t_fail=$((_t_fail + 1))
+      fi
+    done
+    printf '\n'
+    if [ "$_t_fail" -eq 0 ]; then
+      printf '%s✓ All %d entries OK.%s\n' "$_tc_ok" "$_t_ok" "$RESET"
+      exit 0
+    else
+      printf '%s✗ %d failed / %d ok.%s\n' "$_tc_fail" "$_t_fail" "$_t_ok" "$RESET"
+      exit 1
+    fi
+  else
+    printf '\n'
+    FEED_PARSER=
+    "feed_$_tfeed"
+    if _test_one_invocation; then
+      printf '\n%s✓ OK.%s\n' "$_tc_ok" "$RESET"
+      exit 0
+    else
+      printf '\n%s✗ Feed returned no usable rows.%s\n' "$_tc_fail" "$RESET"
+      exit 1
+    fi
+  fi
 fi
 
 # Atomic-mkdir lock serializes concurrent refreshes so a fresh install
 # (empty cache → every tick wants a refresh) doesn't fork a thundering
 # herd of curl|jq pipelines. Foreground never blocks on network.
 mkdir -p "$(dirname "$CACHE_FILE")" 2>/dev/null
+
 mtime=$(mtime_of "$CACHE_FILE")
+
+# Double-buffer promotion. refresh_all_feeds writes to "$CACHE_FILE.pending"
+# whenever a live cache already exists; we promote at rotation boundaries
+# (pos=0) so the displayed headline never changes mid-dwell. Stale live
+# cache (past REFRESH_SEC) gets immediate promotion — stale content beats
+# a visible swap. `mv` is atomic; concurrent ticks in the same second lose
+# harmlessly via ENOENT on the source.
+if [ -s "$CACHE_FILE.pending" ]; then
+  if [ "$((now % ROTATION_SEC))" -eq 0 ] || [ "$((now - mtime))" -gt "$REFRESH_SEC" ]; then
+    mv "$CACHE_FILE.pending" "$CACHE_FILE" 2>/dev/null && mtime=$(mtime_of "$CACHE_FILE")
+  fi
+fi
 if [ ! -s "$CACHE_FILE" ] || [ "$((now - mtime))" -gt "$REFRESH_SEC" ]; then
   lock="$CACHE_FILE.lock"
   # Reap stale locks: if a previous refresh was SIGKILLed mid-flight, the
-  # lock dir sticks around forever. Bound: (MAX_REDDIT_SUBS + builtin feeds)
-  # × curl --max-time 5 + slack. With the 15-sub cap plus HN+Lobsters that's
-  # ~85s worst-case; 120s gives headroom. Keep this ≥ worst-case refresh or
-  # concurrent refreshes can race themselves (finding M2).
+  # lock dir sticks around forever. Fetches are parallel, so worst case is
+  # one curl (whole budget = --max-time 8) plus jq/awk merge, ~10s total.
+  # 30s is ~3x that and well under any realistic NEWSLINE_REFRESH_SEC so a
+  # SIGKILL doesn't block refresh for multiple cycles. The old 120s was
+  # sized against a serial-fetch estimate that no longer reflects the code.
+  STALE_REAP_SEC=30
   if [ -d "$lock" ]; then
     lock_mtime=$(mtime_of "$lock")
-    if [ "$((now - lock_mtime))" -gt 120 ]; then
+    if [ "$((now - lock_mtime))" -gt "$STALE_REAP_SEC" ]; then
       rmdir "$lock" 2>/dev/null
     fi
   fi
   # Mirror of the lock reaper: SIGKILL mid-refresh leaves a per-pid buckets
   # dir ($CACHE_FILE.buckets.$$) that refresh_all_feeds normally removes on
-  # success. Without this, killed refreshes accumulate forever.
+  # success. Without this, killed refreshes accumulate forever. Same budget
+  # as the lock reaper — they represent the same class of stale state.
   for _stale_buckets in "$CACHE_FILE".buckets.*; do
     [ -d "$_stale_buckets" ] || continue
     _stale_mtime=$(mtime_of "$_stale_buckets")
-    [ "$((now - _stale_mtime))" -gt 120 ] && rm -rf "$_stale_buckets" 2>/dev/null
+    [ "$((now - _stale_mtime))" -gt "$STALE_REAP_SEC" ] && rm -rf "$_stale_buckets" 2>/dev/null
   done
+  # An orphaned .pending — e.g., a refresh wrote it but the user's terminal
+  # was closed before the next rotation boundary ever fired — would otherwise
+  # sit on disk forever and get promoted on the next session's first pos=0
+  # tick, showing outdated content as if it were fresh. If pending is older
+  # than REFRESH_SEC (the same staleness threshold we apply to the live
+  # cache), drop it and let the next refresh write a new one.
+  if [ -s "$CACHE_FILE.pending" ]; then
+    _pending_mtime=$(mtime_of "$CACHE_FILE.pending")
+    if [ "$((now - _pending_mtime))" -gt "$REFRESH_SEC" ]; then
+      rm -f "$CACHE_FILE.pending" 2>/dev/null
+    fi
+  fi
   if mkdir "$lock" 2>/dev/null; then
     ( refresh_all_feeds; rmdir "$lock" 2>/dev/null ) &
   fi
@@ -628,12 +1224,27 @@ if [ "$SCROLL" != "0" ] && [ "$SCROLL_SEC" -gt 0 ] && [ -n "$next_line" ] && [ "
   exit 0
 fi
 
-if [ -n "$cur_url" ] && [ "$HYPERLINKS_ON" = "1" ]; then
-  # PREFIX lives inside the OSC 8 wrapper so clicking the glyph also opens
-  # the story. Color reset between prefix and feed keeps their palettes
-  # independent; trailing reset closes the feed color.
-  printf '\033]8;;%s\033\\%s%s%s%s%s%s%s\033]8;;\033\\\n' \
-    "$cur_url" "$c_prefix" "$PREFIX" "$RESET" "$c_feed" "$cur_prefix" "$cur_title" "$RESET"
+# URL scheme guard. OSC 8 hands the URL off to the terminal emulator's URL
+# handler on cmd/ctrl-click — and historically those handlers have had
+# argument-injection bugs against schemes like `x-man-page://`, `ssh://`,
+# `file://`, and `javascript:` (CVE-2023-46321 iTerm2, Hyper RCE chain).
+# Allow only http(s). A tampered feed, a jq filter that drifted, or a paste
+# typo can't smuggle in another scheme; worst case is a rendered-but-unlinked
+# headline. C0 stripping in _fetch_one is the other half of this defense —
+# this layer catches whole-scheme swaps that byte-filtering doesn't see.
+case "$cur_url" in
+  http://*|https://*) _link_ok=1 ;;
+  *) _link_ok=0 ;;
+esac
+
+if [ -n "$cur_url" ] && [ "$HYPERLINKS_ON" = "1" ] && [ "$_link_ok" = "1" ]; then
+  # PREFIX lives OUTSIDE the OSC 8 wrapper so the hover/cmd-click underline
+  # doesn't extend under the brand glyph (the trailing space in "Ξ " makes
+  # that underline render as a detached fragment, which looks like a glitch).
+  # The headline is a big enough click target on its own.
+  printf '%s%s%s\033]8;;%s\033\\%s%s%s\033]8;;\033\\\n' \
+    "$c_prefix" "$PREFIX" "$RESET" \
+    "$cur_url" "$c_feed" "${cur_prefix}${cur_title}" "$RESET"
 else
   printf '%s%s%s%s%s%s%s\n' \
     "$c_prefix" "$PREFIX" "$RESET" "$c_feed" "$cur_prefix" "$cur_title" "$RESET"

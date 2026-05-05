@@ -35,12 +35,18 @@ else
       case "${COLORTERM:-}" in
         truecolor|24bit) COLOR_DEPTH=24 ;;
         *)
+          # TERM-based fallback. We used to maintain an explicit allowlist
+          # of terminals here (xterm-kitty, alacritty, wezterm, …) but both
+          # the listed branch and the fallback resolved to depth=8, so the
+          # list was cosmetic — and a maintenance trap (every new terminal
+          # like xterm-ghostty or warp looks "missing"). Modern terminals
+          # advertise truecolor via COLORTERM above; the TERM fallback just
+          # needs to pick between 0 (dumb), 4 (no TERM, conservative), and
+          # 8 (anything else). No hand-maintained list.
           case "${TERM:-}" in
-            dumb)          COLOR_DEPTH=0 ;;
-            '')            COLOR_DEPTH=4 ;;
-            *-256color|screen-256*|tmux-256*|xterm-kitty|alacritty|wezterm)
-                           COLOR_DEPTH=8 ;;
-            *)             COLOR_DEPTH=8 ;;
+            dumb) COLOR_DEPTH=0 ;;
+            '')   COLOR_DEPTH=4 ;;
+            *)    COLOR_DEPTH=8 ;;
           esac
           ;;
       esac

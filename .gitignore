@@ -8,6 +8,13 @@ npm-debug.log*
 
 # Project-specific instructions kept locally, not in the repo
 CLAUDE.md
+AGENTS.md
+.agents/
+.claude/
+
+# Local scratch
+c.txt
+*.pdf
 
 # Editor / OS cruft
 .DS_Store
