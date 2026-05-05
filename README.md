@@ -36,7 +36,7 @@ Reddit rate-limits anonymous JSON. When a refresh tick gets a 429, that feed sit
 
 Drop a `<name>.sh` file in `~/.claude/claude-newsline/feeds/` and it joins the rotation. The runtime globs the directory on every refresh, so new plugins show up on the next tick without a rebuild or a reinstall. Filename maps to function name: `nyt.sh` must define `feed_nyt()`.
 
-> **Trust boundary.** Plugins in this directory are sourced as shell code every refresh — same trust model as a dotfile or a `~/.zshrc` include. Audit third-party plugins before dropping them in, and don't chmod the directory world-writable. If a plugin fails to load, `NEWSLINE_DEBUG=1` reports it under `user feeds skipped:` with the source error.
+> **Trust boundary.** Every refresh sources plugins in this directory as shell code. Same trust model as a dotfile or a `~/.zshrc` include. Audit third-party plugins before dropping them in, and don't chmod the directory world-writable. If a plugin fails to load, `NEWSLINE_DEBUG=1` reports it under `user feeds skipped:` with the source error.
 
 Minimal JSON feed:
 
@@ -49,15 +49,15 @@ feed_nyt() {
   LABEL='NYT'
   URL='https://example.com/nyt-feed.json'
   # jq emits one <label><TAB><title><TAB><url> row per headline.
-  # $default is bound to LABEL — use it as-is or promote based on the title.
-  # URLs MUST be http:// or https:// — other schemes render without OSC 8.
+  # $default is bound to LABEL. Pass it through, or promote based on title.
+  # URLs MUST be http:// or https://. Other schemes render without OSC 8.
   JQ='.articles[] | [$default, .title, .url] | @tsv'
 }
 ```
 
 `FEED_META_<name>` is optional. When present, `NEWSLINE_DEBUG=1` prints each declared key (`description`, `version`, `author`, `homepage`) plus an auto-attached `source=<path>` line so you can audit what's loaded and from where.
 
-A user file named the same as a built-in (`hn.sh`, `reddit.sh`, `lobsters.sh`) replaces that feed's function — last definition wins. That's the escape hatch when you want to tweak a built-in without forking.
+A user file named the same as a built-in (`hn.sh`, `reddit.sh`, `lobsters.sh`) replaces that feed's function. Last definition wins. Use this to tweak a built-in without forking.
 
 Restart Claude Code (or let the cache expire) and the new source rotates in alongside the built-ins. Override the feeds directory with `NEWSLINE_FEEDS_DIR` if you want to keep plugins in a dotfiles repo.
 
@@ -77,13 +77,13 @@ feed_bbc() {
 }
 ```
 
-With no `JQ` declared, a default filter (`.[] | [$default, .title, .link] | @tsv`) is used. Override it the same way you would for a JSON feed — e.g. skip items whose description contains "sponsored":
+With no `JQ` declared, the default filter is `.[] | [$default, .title, .link] | @tsv`. Override it the same way you would for a JSON feed. Example: skip items whose description contains "sponsored":
 
 ```sh
 JQ='.[] | select(.description | test("sponsored"; "i") | not) | [$default, .title, .link] | @tsv'
 ```
 
-`xml-to-json` picks `<link>url</link>` (RSS) or the `href` attribute of `<link .../>` (Atom) automatically, decodes HTML entities (`&amp;` → `&`, `&#8217;` → `'`), and unwraps CDATA. RSS `<description>` and Atom `<summary>` are unified under the `description` key. Declare `api=2` in `FEED_META` so older runtimes skip the plugin cleanly instead of calling a branch they don't understand.
+`xml-to-json` picks `<link>url</link>` (RSS) or the `href` attribute of `<link .../>` (Atom), decodes HTML entities (`&amp;` → `&`, `&#8217;` → `'`), and unwraps CDATA. RSS `<description>` and Atom `<summary>` both map to the `description` key, so one jq filter handles either. Declare `api=2` in `FEED_META` so older runtimes skip the plugin cleanly instead of calling a branch they don't understand.
 
 ### Test a feed before you trust it
 
@@ -134,13 +134,13 @@ feed_jira() {
   JQ='.issues[] | [$default, .fields.summary, "https://company.atlassian.net/browse/\(.key)"] | @tsv'
 }
 # Resolve the user-facing env var to the internal name FEED_PARAMS points at.
-# Without this line, NEWSLINE_JIRA_PROJECTS in your settings.json is ignored —
-# the dispatch loop reads $JIRA_PROJECTS, not $NEWSLINE_JIRA_PROJECTS.
+# Without this line, NEWSLINE_JIRA_PROJECTS in your settings.json is ignored.
+# The dispatch loop reads $JIRA_PROJECTS, not $NEWSLINE_JIRA_PROJECTS.
 JIRA_PROJECTS="${NEWSLINE_JIRA_PROJECTS:-}"
 FEED_PARAMS_jira='JIRA_PROJECTS'
 ```
 
-Then set `NEWSLINE_JIRA_PROJECTS=ENG,INFRA` in Claude Code's `settings.json` under `"env"` (or export it in your shell). Each entry becomes one HTTP request per refresh — keep the list small, same reasoning as the Reddit cap.
+Then set `NEWSLINE_JIRA_PROJECTS=ENG,INFRA` in Claude Code's `settings.json` under `"env"` (or export it in your shell). Each entry becomes one HTTP request per refresh, so keep the list small for the same reason the Reddit cap exists.
 
 ### Debugging
 
@@ -166,7 +166,7 @@ user feeds dir:   /Users/you/.claude/claude-newsline/feeds
 
 Files that fail to source, don't define the expected `feed_<name>` function, or have a filename that isn't a legal shell identifier (leading digit, hyphen) are skipped silently. The rest of the rotation keeps working. Filename validation is `[A-Za-z_][A-Za-z0-9_]*`.
 
-The jq filter is sandboxed by jq itself (no filesystem, no network). The shell function runs inline with `statusline.sh` and has the same trust level as anything else in `~/.claude/` — don't source `.sh` files you haven't read. URLs that come out of the jq filter are validated at render time: anything that isn't `http://` or `https://` still rotates into view but does not get a clickable OSC 8 hyperlink (defense against terminal URL-handler argument injection, e.g. CVE-2023-46321).
+jq sandboxes the filter (no filesystem, no network). The shell function runs inline with `statusline.sh` and has the same trust level as anything else in `~/.claude/`, so don't source `.sh` files you haven't read. The runtime validates URLs the jq filter emits at render time: anything that isn't `http://` or `https://` still rotates into view but does not get a clickable OSC 8 hyperlink (defense against terminal URL-handler argument injection, e.g. CVE-2023-46321).
 
 ## Tuning
 
@@ -227,7 +227,7 @@ Every `REFRESH_SEC` (default 600), the runtime runs, per feed:
 curl -fsS --max-time 5 "$URL" | jq -r --arg default "$LABEL" "$JQ"
 ```
 
-The jq filter is the parser. There's no schema detection — open the endpoint once, see what you're working with, write the jq. `$default` is bound to `LABEL`; a filter can pass it through unchanged or rewrite it per-item (`feed_hn` promotes `Show HN:` / `Ask HN:` prefixes into their own labels at refresh time).
+The jq filter is the parser. There's no schema detection. Open the endpoint once, see what you're working with, write the jq. `$default` is bound to `LABEL`; a filter can pass it through unchanged or rewrite it per-item (`feed_hn` promotes `Show HN:` / `Ask HN:` prefixes into their own labels at refresh time).
 
 Lobsters is the simplest. Top-level array, title and URL already present:
 
@@ -287,7 +287,7 @@ FEED_PARAMS_myfeed='MYFEED_ENTRIES'
 
 The dispatch loop in `refresh_all_feeds` sees `FEED_PARAMS_myfeed`, splits `$MYFEED_ENTRIES` on `,`, and calls `feed_myfeed` once per entry. Return non-zero to skip a bad entry without aborting the rest. See `feed_reddit` in `bin/statusline.sh` for the reference implementation.
 
-Built-ins declare the `NEWSLINE_*`-to-internal binding in the CONFIG block at the top of `bin/statusline.sh` (e.g. `REDDIT_SUBS="${NEWSLINE_REDDIT_SUBS:-programming}"`) — put new built-in bindings there, not in the feed function, so they run before any refresh.
+Built-ins declare the `NEWSLINE_*`-to-internal binding in the CONFIG block at the top of `bin/statusline.sh` (e.g. `REDDIT_SUBS="${NEWSLINE_REDDIT_SUBS:-programming}"`). Put new built-in bindings there, not in the feed function, so they run before any refresh.
 
 ## Testing
 
@@ -299,11 +299,11 @@ RUN_ONLY='install|uninstall' ./test.sh
 
 Tests run under a fresh `mktemp -d`, so your real `~/.claude/` is never touched. CI runs the same script on every push ([workflow](.github/workflows/test.yml)).
 
-A few sections piggyback on state set up earlier (primed cache, mocked `bin/`). A narrow `RUN_ONLY` that works on its own can fail here — widen the pattern until setup is included.
+A few sections piggyback on state set up earlier (primed cache, mocked `bin/`). A narrow `RUN_ONLY` that works on its own can fail here. Widen the pattern until setup is included.
 
 ## Contributing
 
-PRs and bug reports both welcome. Thanks for reading this far.
+PRs and bug reports both welcome.
 
 1. Fork, branch from `main`.
 2. `./test.sh` stays green.
