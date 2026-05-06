@@ -243,7 +243,11 @@ guard_num() {
   eval "_gn_v=\$$1"
   # shellcheck disable=SC2154  # _gn_v is assigned by the preceding `eval`.
   case "$_gn_v" in
-    ''|*[!0-9]*) eval "$1=$2"; return ;;
+    # Empty / non-digits: pure typo, fall back.
+    # Leading zero on a multi-digit value: POSIX `$(( ))` reads it as octal,
+    # so `008` / `09` would crash arithmetic on every status-line tick (and
+    # Claude Code surfaces stderr → user-visible noise). Reject those too.
+    ''|*[!0-9]*|0[0-9]*) eval "$1=$2"; return ;;
   esac
   if [ "${3:-}" != "allow_zero" ] && [ "$_gn_v" = "0" ]; then
     eval "$1=$2"
@@ -253,6 +257,12 @@ guard_num ROTATION_SEC 20
 guard_num REFRESH_SEC  600
 guard_num MAX_TITLE    80
 guard_num SCROLL_SEC   5 allow_zero
+# CACHE_CHUNK feeds the awk interleave loop's `pos += chunk` step. Awk coerces
+# strings to 0, so an empty / non-numeric / "0" value would make the loop never
+# advance — awk pegs a CPU and holds the lock until STALE_REAP_SEC. guard_num
+# (rejecting 0 in default mode) keeps the increment positive.
+CACHE_CHUNK="${NEWSLINE_CACHE_CHUNK:-1}"
+guard_num CACHE_CHUNK 1
 # Separator rendered between consecutive headlines during the scroll
 # transition — gives the eye a clear boundary when one article leaves and
 # the next enters. Default "  |  " (pipe, padded with two spaces each side).
@@ -310,6 +320,29 @@ _SCRIPT_DIR=$(CDPATH=; cd -- "$(dirname -- "$_script")" && pwd)
 
 TAB=$(printf '\t')
 
+# Feature-detect iconv once. We pipe titles/URLs through `iconv -f UTF-8
+# -t UTF-8 -c` to drop bare C1 control bytes (0x80-0x9F) that aren't part
+# of a valid UTF-8 sequence — defense-in-depth against legacy 8-bit-C1
+# terminals (CSI=0x9B, OSC=0x9D). The C0 strip in _fetch_one's tr handles
+# 0x00-0x1F+0x7F directly, but the C1 range can't be tr-stripped without
+# corrupting every multi-byte UTF-8 codepoint, so we lean on iconv's
+# encoding awareness. If iconv is missing (rare — POSIX standard utility,
+# default on macOS/Linux), we degrade to "tr handled the C0 attack surface;
+# C1 is theoretical on modern terminals." Same fall-through pattern as the
+# truncate_title and render_scroll_window iconv uses elsewhere.
+if iconv -f UTF-8 -t UTF-8 -c </dev/null >/dev/null 2>&1; then
+  _HAVE_ICONV=1
+else
+  _HAVE_ICONV=0
+fi
+_pipe_strip_c1() {
+  if [ "$_HAVE_ICONV" = "1" ]; then
+    iconv -f UTF-8 -t UTF-8 -c 2>/dev/null
+  else
+    cat
+  fi
+}
+
 # ============= USER FEEDS =============
 # Drop a `<name>.sh` file in $NEWSLINE_FEEDS_DIR (default:
 # $CLAUDE_CONFIG_DIR/claude-newsline/feeds) and it's picked up as a feed.
@@ -354,6 +387,15 @@ load_user_feeds() {
 "
         continue ;;
     esac
+    # Reset FEED_META_<name> before sourcing so a user file overriding a
+    # built-in (e.g. hn.sh) doesn't silently inherit the built-in's
+    # description / category / api line. The user's file either sets its
+    # own metadata (in which case we use that) or doesn't (in which case
+    # we attach just the auto source= line below). Without this clear, the
+    # debug report would render mixed-provenance metadata: built-in's
+    # description plus the user file's source=, which reads as a
+    # contradiction.
+    eval "unset FEED_META_$_uname"
     # Capture source errors to a per-plugin tempfile so the debug report can
     # surface WHY a file failed (syntax error, unset variable under -u, …)
     # without polluting the hot path's stderr. mktemp fallback: if /tmp
@@ -443,10 +485,21 @@ mtime_of() {
 }
 
 is_disabled() {
-  case ",$FEEDS_DISABLED," in
-    *",$1,"*) return 0 ;;
-    *) return 1 ;;
-  esac
+  # Tolerate user-friendly CSV like "reddit, lobsters" — the older substring
+  # match against a bracketed haystack silently failed to disable any entry
+  # whose comma neighbor carried whitespace. Split on ',' under a scoped IFS,
+  # tr-strip each entry, and compare equal. The installer normalizes on
+  # write too, but hand-edited .env / settings.json land here directly.
+  _id_target=$1
+  _id_old_ifs=$IFS
+  IFS=,
+  for _id_e in $FEEDS_DISABLED; do
+    case "$(printf '%s' "$_id_e" | tr -d '[:space:]')" in
+      "$_id_target") IFS=$_id_old_ifs; return 0 ;;
+    esac
+  done
+  IFS=$_id_old_ifs
+  return 1
 }
 
 # Byte-truncate a string to ≤$2 bytes and repair any trailing partial UTF-8
@@ -557,6 +610,7 @@ _fetch_one() {
       "$URL" 2>/dev/null \
     | _parse_body 2>/dev/null \
     | LC_ALL=C tr -d '\000-\010\013-\037\177' \
+    | _pipe_strip_c1 \
     | awk 'NF'
 }
 
@@ -581,7 +635,7 @@ _fetch_one() {
 # Forks are safe because LABEL/URL/JQ are copied into each child at fork time
 # — the parent loop can reassign them for the next iteration without racing
 # the already-running children. Parallelism means worst-case refresh is
-# bounded by the SLOWEST single fetch (curl --max-time 5) plus jq/awk
+# bounded by the SLOWEST single fetch (curl --max-time 8) plus jq/awk
 # overhead — not the SUM of all fetches. Empirical: 7 parallel fetches
 # complete in <1s on a warm connection. Used by STALE_REAP_SEC below.
 refresh_all_feeds() {
@@ -628,13 +682,18 @@ refresh_all_feeds() {
     fi
   done
   wait
+  # Heartbeat: bump the lock dir's mtime now that all curls are done so
+  # the stale-lock reaper (STALE_REAP_SEC, see below) doesn't clobber a
+  # live merge phase on a slow disk. The reaper compares now - mtime; we
+  # touch right after the network phase so the merge has a fresh budget.
+  [ -d "$CACHE_FILE.lock" ] && touch "$CACHE_FILE.lock" 2>/dev/null
 
   # Round-robin merge: CACHE_CHUNK lines per bucket per pass. Buckets exhaust
   # at different rates (HN returns 30, Lobsters 25, Reddit varies) — the
   # inner bounds check drops exhausted buckets so remaining buckets aren't
   # clumped at the tail.
   if [ "$_bucket_idx" -gt 0 ]; then
-    awk -v chunk="${NEWSLINE_CACHE_CHUNK:-1}" '
+    awk -v chunk="$CACHE_CHUNK" '
       FNR == 1 { fi++ }
       { lines[fi, lc[fi]++] = $0 }
       END {
@@ -784,7 +843,7 @@ if [ "${NEWSLINE_DEBUG:-0}" = "1" ]; then
   echo
   echo 'config (env > .env > default):'
   _dbg_show NEWSLINE_ROTATION_SEC     "$ROTATION_SEC"
-  _dbg_show NEWSLINE_CACHE_CHUNK      "${NEWSLINE_CACHE_CHUNK:-1}"
+  _dbg_show NEWSLINE_CACHE_CHUNK      "$CACHE_CHUNK"
   _dbg_show NEWSLINE_REFRESH_SEC      "$REFRESH_SEC"
   _dbg_show NEWSLINE_MAX_TITLE        "$MAX_TITLE"
   _dbg_show NEWSLINE_SCROLL           "$SCROLL"
@@ -996,6 +1055,7 @@ if [ -n "${NEWSLINE_TEST_FEED:-}" ]; then
     _to_parser="${FEED_PARSER:-jq}"
     _to_rows=$(_parse_body <"$_to_body" 2>"$_to_errfile" \
                | LC_ALL=C tr -d '\000-\010\013-\037\177' \
+               | _pipe_strip_c1 \
                | awk 'NF')
     rm -f "$_to_body"
     if [ -s "$_to_errfile" ]; then
@@ -1134,11 +1194,13 @@ if [ ! -s "$CACHE_FILE" ] || [ "$((now - mtime))" -gt "$REFRESH_SEC" ]; then
   lock="$CACHE_FILE.lock"
   # Reap stale locks: if a previous refresh was SIGKILLed mid-flight, the
   # lock dir sticks around forever. Fetches are parallel, so worst case is
-  # one curl (whole budget = --max-time 8) plus jq/awk merge, ~10s total.
-  # 30s is ~3x that and well under any realistic NEWSLINE_REFRESH_SEC so a
-  # SIGKILL doesn't block refresh for multiple cycles. The old 120s was
-  # sized against a serial-fetch estimate that no longer reflects the code.
-  STALE_REAP_SEC=30
+  # one curl (whole budget = --max-time 8) plus jq/awk merge across many
+  # buckets — under disk pressure and lots of feeds, real-world timing has
+  # measured up to the 30s mark. 60s is 2× the observed worst case while
+  # still well under any realistic NEWSLINE_REFRESH_SEC, so a SIGKILL
+  # doesn't block refresh for multiple cycles. refresh_all_feeds touches
+  # the lock dir between phases, so a live process keeps its mtime fresh.
+  STALE_REAP_SEC=60
   if [ -d "$lock" ]; then
     lock_mtime=$(mtime_of "$lock")
     if [ "$((now - lock_mtime))" -gt "$STALE_REAP_SEC" ]; then
@@ -1153,6 +1215,16 @@ if [ ! -s "$CACHE_FILE" ] || [ "$((now - mtime))" -gt "$REFRESH_SEC" ]; then
     [ -d "$_stale_buckets" ] || continue
     _stale_mtime=$(mtime_of "$_stale_buckets")
     [ "$((now - _stale_mtime))" -gt "$STALE_REAP_SEC" ] && rm -rf "$_stale_buckets" 2>/dev/null
+  done
+  # Same SIGKILL class for the merged-tape staging file: refresh_all_feeds
+  # writes the awk merge into $CACHE_FILE.new.$$ and only mv's it into place
+  # (.pending or the live cache) on success. A kill between awk completion
+  # and the mv leaves the .new.<pid> file. Without a reaper these accumulate
+  # forever and trip uninstall's `rmdir cache/` with ENOTEMPTY.
+  for _stale_new in "$CACHE_FILE".new.*; do
+    [ -f "$_stale_new" ] || continue
+    _stale_mtime=$(mtime_of "$_stale_new")
+    [ "$((now - _stale_mtime))" -gt "$STALE_REAP_SEC" ] && rm -f "$_stale_new" 2>/dev/null
   done
   # An orphaned .pending — e.g., a refresh wrote it but the user's terminal
   # was closed before the next rotation boundary ever fired — would otherwise
@@ -1214,9 +1286,12 @@ cur_prefix=$_PL_PREFIX
 # Decide scroll vs static. Dwell = ROTATION_SEC - SCROLL_SEC; once past it
 # within the cycle we're in the scroll transition. Requires a next line and
 # a positive SCROLL_SEC, else fall back to static rendering.
+#
+# dwell is always >= 1 here: guard_num enforces ROTATION_SEC >= 1, and the
+# clamp earlier (SCROLL_SEC >= ROTATION_SEC → SCROLL_SEC = ROTATION_SEC - 1)
+# guarantees SCROLL_SEC < ROTATION_SEC. So no negative-clamp guard is needed.
 pos_in_cycle=$(( now % ROTATION_SEC ))
 dwell=$(( ROTATION_SEC - SCROLL_SEC ))
-[ "$dwell" -lt 0 ] && dwell=0
 
 if [ "$SCROLL" != "0" ] && [ "$SCROLL_SEC" -gt 0 ] && [ -n "$next_line" ] && [ "$pos_in_cycle" -ge "$dwell" ]; then
   parse_line "$next_line"
@@ -1232,8 +1307,11 @@ fi
 # typo can't smuggle in another scheme; worst case is a rendered-but-unlinked
 # headline. C0 stripping in _fetch_one is the other half of this defense —
 # this layer catches whole-scheme swaps that byte-filtering doesn't see.
+# RFC 3986: schemes are case-insensitive. The case-class glob keeps the
+# guard pure-shell (no fork) while still accepting `HTTP://` / `Https://`
+# variants seen in legacy Atom feeds. Anything else still drops the link.
 case "$cur_url" in
-  http://*|https://*) _link_ok=1 ;;
+  [hH][tT][tT][pP]://*|[hH][tT][tT][pP][sS]://*) _link_ok=1 ;;
   *) _link_ok=0 ;;
 esac
 

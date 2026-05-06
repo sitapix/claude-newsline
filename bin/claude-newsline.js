@@ -195,26 +195,31 @@ function pluginApiVersion(meta) {
   return Number.isFinite(n) && n > 0 ? n : 1;
 }
 
-// Probe a user plugin in a subprocess and make sure it matches the runtime
-// loader's basic contract: the file must source cleanly and define
-// feed_<name>(). The subprocess keeps side effects out of the installer
-// process, but this still executes plugin shell code, same trust boundary as
-// statusline.sh's load_user_feeds.
-function probeUserFeed(pathname, name) {
-  const { spawnSync } = require('child_process');
-  const script = '. "$1" >/dev/null 2>/dev/null || exit 10\ncommand -v "feed_$2" >/dev/null 2>&1 || exit 11';
-  const r = spawnSync('sh', ['-c', script, 'sh', pathname, name], {
-    stdio: 'ignore',
-    timeout: 2000,
-  });
-  if (r.error) {
-    if (r.error.code === 'ETIMEDOUT') return { ok: false, reason: 'source timed out' };
-    return { ok: false, reason: r.error.message || 'source failed' };
-  }
-  if (r.status === 0) return { ok: true };
-  if (r.status === 10) return { ok: false, reason: 'source failed' };
-  if (r.status === 11) return { ok: false, reason: `feed_${name} function not defined` };
-  return { ok: false, reason: `source failed (exit ${r.status == null ? 'unknown' : r.status})` };
+// Statically detect whether a plugin file declares `feed_<name>()`. We don't
+// source the file: that would execute arbitrary plugin code at install /
+// `--list-feeds` / wizard-render time, and a misbehaving plugin (infinite
+// loop, network call, fork bomb) could hang the installer. The runtime is
+// the authoritative gate — it sources lazily on the first refresh, captures
+// stderr, and reports failures via NEWSLINE_DEBUG=1. The installer's job
+// here is the cheaper "does the file LOOK like a plugin?" check.
+//
+// Matches the canonical POSIX function declaration with optional leading
+// whitespace and an optional `function` keyword. A trailing brace on the
+// SAME LINE is required (POSIX function definitions allow brace on next
+// line, and most shells accept it; we rely on the dominant inline-brace
+// shape and let the runtime catch the rare exotic format). False negatives
+// here cost a "feed not loaded — file present" surface in --list-feeds;
+// false positives cost the same plus a runtime error that the user sees in
+// NEWSLINE_DEBUG=1. Both are recoverable.
+function detectFeedFunction(src, name) {
+  // The brace may sit on the same line OR on the next line (POSIX accepts
+  // both; bash accepts both). Allowing `[ \\t\\r\\n]*\\{` covers the
+  // next-line-brace style without changing behavior for the inline shape.
+  const re = new RegExp(
+    `(?:^|\\n)[ \\t]*(?:function[ \\t]+)?feed_${name}[ \\t]*\\([ \\t]*\\)[ \\t\\r\\n]*\\{`,
+    'm'
+  );
+  return re.test(src);
 }
 
 // Scan EVERY *.sh in the user-feeds directory that passes the filename
@@ -234,8 +239,9 @@ function probeUserFeed(pathname, name) {
 //      "api too new."
 //   2. Unreadable file — skipped entirely for the same reason (author bug,
 //      not a compat signal).
-//   3. Source failure / missing feed_<name> — INCLUDED, tagged incompatible
-//      so --list-feeds can explain why the file will not load.
+//   3. Missing feed_<name>() definition — INCLUDED, tagged incompatible.
+//      Static detection catches the dominant shape; weird formats slip
+//      through to the runtime gate, which still skips them safely.
 //   4. `api=` declaration > FEED_API_VERSION — INCLUDED, tagged
 //      `{ok:false, reason:'api', declaredApi, runtimeApi}` so callers can
 //      render the "drop-in-but-wont-load" state.
@@ -255,11 +261,23 @@ function scanAllUserFeeds(userFeedsDir) {
     const p = path.join(userFeedsDir, entry);
     let src;
     try { src = fs.readFileSync(p, 'utf8'); }
-    catch (_) { continue; }
+    catch (e) {
+      // Unreadable file (perms, dangling symlink, etc.). The runtime would
+      // also fail to source it and surface the error via NEWSLINE_DEBUG=1
+      // — mirror that visibility here so --list-feeds doesn't silently
+      // hide a file the user dropped in.
+      out.push({
+        name, path: p, meta: {},
+        compat: { ok: false, reason: `unreadable (${e.code || e.message})` },
+      });
+      continue;
+    }
     const meta = parseFeedMeta(src, name);
-    const probe = probeUserFeed(p, name);
-    if (!probe.ok) {
-      out.push({ name, path: p, meta, compat: probe });
+    if (!detectFeedFunction(src, name)) {
+      out.push({
+        name, path: p, meta,
+        compat: { ok: false, reason: `feed_${name}() not defined in file` },
+      });
       continue;
     }
     const declaredApi = pluginApiVersion(meta);
@@ -288,11 +306,22 @@ function scanUserFeeds(userFeedsDir) {
 // `author`/`homepage` keys have rendering hooks elsewhere — the rest are
 // just surfaced verbatim.
 function parseFeedMeta(src, feedName) {
-  const re = new RegExp(`^FEED_META_${feedName}\\s*=\\s*'([^']*)'`, 'm');
+  // Accept single OR double quotes — POSIX sh accepts both, the runtime
+  // sources either form just fine, so the static parser must too. A plugin
+  // written with `FEED_META_x="api=99\n…"` would otherwise look like
+  // "no metadata declared" to the installer (implicit api=1, listed as
+  // loadable) while the runtime reads the real `api=99` and silently
+  // skips. The two alternations are mutually exclusive (different quote
+  // chars) so capture group order doesn't matter.
+  const re = new RegExp(
+    `^FEED_META_${feedName}\\s*=\\s*(?:'([^']*)'|"([^"]*)")`,
+    'm'
+  );
   const m = src.match(re);
   if (!m) return {};
+  const body = m[1] !== undefined ? m[1] : m[2];
   const out = {};
-  for (const line of m[1].split('\n')) {
+  for (const line of body.split('\n')) {
     const eq = line.indexOf('=');
     if (eq < 0) continue;
     const k = line.slice(0, eq);
@@ -366,9 +395,10 @@ feed_${name}() {
 //
 // One regex with a leading alternation: either our segment sits at the
 // start of the string (standalone) or it's preceded by a `;` separator
-// (chained suffix). Quoted paths that embedded a literal ' via the POSIX
-// '\'' trick are NOT matched — those are exceedingly rare (a $HOME with an
-// apostrophe) and would need manual cleanup on uninstall.
+// (chained suffix). The QUOTED_PATH alternation also recognises the POSIX
+// `'\''` escape sequence shellQuote emits when $HOME contains a literal
+// apostrophe — without that, an `~/jane's home/...` install would leak its
+// suffix on uninstall and double-append on re-install.
 //
 // Ownership marker: `CLAUDE_NEWSLINE=<ver> bash '<path>'`. Per-command env
 // prefix (scoped to the bash invocation, not exported) so it's a pure tag.
@@ -378,7 +408,8 @@ feed_${name}() {
 const MARKER_VAR = 'CLAUDE_NEWSLINE';
 const MARKER_VALUE = 'v1';
 const MARKER_PREFIX = `(?:${MARKER_VAR}=[A-Za-z0-9._-]+\\s+)?`;
-const QUOTED_PATH = "'[^'\\n]*/claude-newsline\\.sh'";
+// Body: any non-quote/non-newline char, OR the four-char POSIX escape '\''.
+const QUOTED_PATH = "'(?:[^'\\n]|'\\\\'')*/claude-newsline\\.sh'";
 const UNQUOTED_PATH = "/[^\\s;&|'\"`$]*/claude-newsline\\.sh";
 const CMD_TAIL = `${MARKER_PREFIX}bash\\s+(?:${QUOTED_PATH}|${UNQUOTED_PATH})`;
 // End-of-chain (our canonical install shape: `… ; bash '<path>'`). Also
@@ -460,6 +491,13 @@ function isValidRedditEntry(entry) {
   return SUBREDDIT_REGEX.test(e) || USER_MULTI_REGEX.test(e);
 }
 const DEFAULT_REDDIT_SUB = loadShDefault('NEWSLINE_REDDIT_SUBS', 'programming');
+// Runtime defaults for the two cosmetic knobs. Pulled from statusline.sh so
+// the elision rule ("user picks the runtime default → drop the override") works
+// for color and separator the same way it does for rotation and reddit-subs.
+// A future statusline.sh default change updates the elision threshold without
+// any JS edits — same drift-prevention pattern as DEFAULT_ROTATION_SEC.
+const DEFAULT_COLOR_FEED = loadShDefault('NEWSLINE_COLOR_FEED', 'dim_yellow');
+const DEFAULT_LABEL_SEP  = loadShDefault('NEWSLINE_LABEL_SEP', ' \u2022 ');
 // Cap keeps a configured-too-enthusiastically user from issuing N sequential
 // curls on every REFRESH_SEC tick; also bounds worst-case refresh time
 // against the 120s stale-lock reaper so refreshes can't race themselves.
@@ -490,6 +528,17 @@ function validateRedditSubs(csv) {
 }
 function normalizeRedditSubs(csv) {
   return parseCsv(csv).map(normalizeRedditEntry).join(',');
+}
+
+// Drop interior whitespace and re-emit the canonical comma-tight form.
+// is_disabled() in statusline.sh historically did a literal ",$x," substring
+// match against the haystack, so a user-friendly "reddit, lobsters" left a
+// leading space on the second entry and silently failed to disable it.
+// Both the installer (here) and the runtime (now) trim per-entry; this
+// keeps the on-disk shape canonical so a hand-written `.env` that sneaks
+// past the installer still works at runtime via the sh-side normalizer.
+function normalizeFeedsDisabled(csv) {
+  return parseCsv(csv).join(',');
 }
 
 function configDir() {
@@ -701,19 +750,55 @@ function readSettings(p) {
 // write there so `rename()` doesn't replace the link with a regular file.
 // The tmp file lives next to the real target so rename stays atomic on the
 // same filesystem.
+//
+// Permissions: settings.json's `env` block frequently holds API keys and
+// other secrets. A naive writeFileSync inherits the umask (typically 0o644),
+// which would silently widen a security-conscious user's `chmod 600`. Stat
+// the existing file (or symlink target) first and reapply its mode to the
+// tmp before rename. First install (no prior file) defaults to 0o600 — same
+// reasoning, applied to the conservative case.
+const NEW_SETTINGS_MODE = 0o600;
 function writeSettings(p, obj) {
   let target = p;
+  let preservedMode = null;
   try {
     if (fs.lstatSync(p).isSymbolicLink()) {
-      target = fs.realpathSync(p);
+      try {
+        target = fs.realpathSync(p);
+      } catch (e) {
+        // Broken symlink: lstat reports a link but the target is missing.
+        // Replacing the link with a regular file would silently destroy
+        // the dotfiles intent. Surface a clear error so the user can fix
+        // the link before re-running install.
+        if (e.code === 'ENOENT') {
+          throw new Error(
+            `${p} is a symlink to a missing target.\n` +
+            `Fix the link before re-running install.`
+          );
+        }
+        throw e;
+      }
+    }
+    // Stat AFTER symlink resolution so we read the real file's mode, not
+    // the link's (which on most platforms is meaningless / fixed).
+    try {
+      preservedMode = fs.statSync(target).mode & 0o777;
+    } catch (e) {
+      if (e.code !== 'ENOENT') throw e;
     }
   } catch (e) {
     if (e.code !== 'ENOENT') throw e;
   }
   const tmp = tmpSibling(target);
   const data = JSON.stringify(obj, null, 2) + '\n';
+  // Mode passed to writeFileSync only takes effect on file creation, so
+  // write to tmp WITH the chosen mode and let rename carry it over. An
+  // umask narrower than the chosen mode (rare but possible — e.g. 0o077)
+  // would still cap us; chmod after open closes that gap deterministically.
+  const mode = preservedMode != null ? preservedMode : NEW_SETTINGS_MODE;
   try {
-    fs.writeFileSync(tmp, data);
+    fs.writeFileSync(tmp, data, { mode });
+    try { fs.chmodSync(tmp, mode); } catch (_) { /* best-effort across umask */ }
     fs.renameSync(tmp, target);
   } catch (e) {
     try { fs.unlinkSync(tmp); } catch (_) { /* ignore */ }
@@ -729,17 +814,41 @@ function writeSettings(p, obj) {
 // generations of mistakes. Bumpable; 10 is arbitrary but roomy.
 const MAX_BACKUPS = 10;
 
-// List all existing .bak.* files for a settings path, sorted ascending by
-// the filename. The suffix is a fixed-width Unix timestamp (with an
-// optional collision-counter tail like `.bak.<ts>.1`), so lex sort
-// coincides with chronological order — the last element is the newest.
+// List all existing .bak.* files for a settings path, sorted oldest-first by
+// (timestamp, collision counter). Lex sort would put `.bak.<ts>.10` before
+// `.bak.<ts>.2` because '1' < '2' — and our retry loop creates up to .999
+// collision counters, so a high-collision second would prune the wrong file
+// at MAX_BACKUPS time. Pulling the numbers out and sorting numerically keeps
+// chronological order honest.
+// Escape every regex meta-character. The earlier inline form was buggy:
+// `[.*+?^${}()|[\\]\\\\]` looked like a 14-char class but the `]` after `\\`
+// closed the class early, so `.replace(...)` was a no-op for normal bases.
+// Result: `settings.json` got embedded with an unescaped `.`, allowing
+// look-alike filenames (`settingsXjson.bak.123`) to be matched and pruned.
+// Spelled out via a named constant so a reader can verify the set without
+// re-counting brackets.
+const REGEX_META_RE = /[.*+?^${}()|[\]\\]/g;
+function escapeRegex(s) { return String(s).replace(REGEX_META_RE, '\\$&'); }
+
 function listBackups(settingsPath) {
   const dir = path.dirname(settingsPath);
   const base = path.basename(settingsPath);
+  // Match `<base>.bak.<ts>` or `<base>.bak.<ts>.<n>`. Files that don't fit
+  // the shape (some other tool's `.bak.<word>`) are skipped — we only own
+  // and prune our own naming scheme.
+  const re = new RegExp(
+    `^${escapeRegex(base)}\\.bak\\.(\\d+)(?:\\.(\\d+))?$`
+  );
   try {
     return fs.readdirSync(dir)
-      .filter(f => f.startsWith(`${base}.bak.`))
-      .sort();
+      .map(f => {
+        const m = f.match(re);
+        if (!m) return null;
+        return { name: f, ts: Number(m[1]), seq: Number(m[2] || 0) };
+      })
+      .filter(Boolean)
+      .sort((a, b) => a.ts - b.ts || a.seq - b.seq)
+      .map(x => x.name);
   } catch (_) {
     return [];
   }
@@ -875,73 +984,101 @@ function validateColor(c) {
   );
 }
 
+// Map a single flag value onto an owned env key. Centralizes the three
+// shapes every owned key has to handle:
+//   opt === null              → flag not passed; leave the patch alone
+//   opt === ''                → explicit clear (`--FLAG ""`); emit delete sentinel
+//   transform(opt) === default → user picked the runtime default; emit delete
+//                                sentinel so a stale prior override clears
+//   otherwise                 → write transform(opt)
+//
+// The "matches default → clear" rule fixes a stale-key bug: with
+// `.env.NEWSLINE_ROTATION_SEC=30` already in place, running
+// `--rotation 20` (the runtime default) used to silently leave the 30
+// behind because the patch elided the write. The user reasonably expected
+// the explicit choice of the default to take effect; collapsing it to the
+// delete sentinel makes that work.
+//
+// transform default is String; defaultValue is the post-transform string
+// (caller's responsibility to pre-stringify numeric defaults so equality
+// is by value, not type).
+function setOrClear(env, key, opt, { transform = String, defaultValue } = {}) {
+  if (opt === null) return;
+  if (opt === '') { env[key] = undefined; return; }
+  const value = transform(opt);
+  if (defaultValue !== undefined && value === defaultValue) {
+    env[key] = undefined;
+    return;
+  }
+  env[key] = value;
+}
+
 // Map wizard/flag opts → env patch. Keys returned MUST be in OWNED_ENV_KEYS.
 // This is the single source of truth for "what env does install() write" —
 // describePlan prints from this map, applyPlan routes it through reconcileEnv.
 //
 // Invariant: a value of `undefined` in the returned patch means "delete this
-// key from .env" (revert to the runtime default in statusline.sh). This is
-// produced by `--FLAG ""` / `--FLAG=""` (explicit clear) and by the `--labels`
-// switch (undo a prior `--no-labels`). reconcileEnv is the ONLY correct way
-// to apply this patch — a naive `Object.assign` would write the string
-// "undefined" into .env on JSON.stringify. REDDIT_SUBS/ROTATION_SEC at the
-// runtime default are also elided so users who accept defaults don't end up
-// with a redundant .env key.
+// key from .env" (revert to the runtime default in statusline.sh). Produced
+// by `--FLAG ""` (explicit clear), `--FLAG <runtime-default>` (matches default),
+// and the `--labels` switch (undo a prior `--no-labels`). reconcileEnv is the
+// ONLY correct way to apply this patch — a naive `Object.assign` would write
+// the string "undefined" into .env on JSON.stringify.
 //
 // `null` in opts means "flag not passed" → no key in the patch at all; `''`
 // means "flag passed with empty value" → undefined sentinel → delete.
 function buildEnvUpdates(opts) {
   const env = {};
+
   // --only and --disable both target FEEDS_DISABLED. --only wins when both
-  // are passed (more specific: "these feeds only"). Each handles the explicit-
-  // clear case: `--only ""` is meaningless (can't enable zero feeds), so we
-  // treat `--only ""` the same as `--disable ""` (clear the key). Inverting
-  // a full --only list (e.g. every feed selected) also yields an empty
-  // disabled set; the null→'' collapse at the end routes that to the delete
-  // sentinel too, so wizard "select all" and flag "clear" converge.
+  // are passed (more specific: "these feeds only"). `--only ""` is meaningless
+  // (can't enable zero feeds), so it converges to the same clear as
+  // `--disable ""`. Inverting a full --only list also yields an empty
+  // disabled string; setOrClear's clear-on-empty-string rule routes both
+  // through the same delete sentinel.
   let feedsDisabled = null;
   if (opts.only !== null) {
     feedsDisabled = opts.only === '' ? '' : invertOnly(opts.only);
   } else if (opts.disable !== null) {
     feedsDisabled = opts.disable;
   }
-  if (feedsDisabled !== null) {
-    env.NEWSLINE_FEEDS_DISABLED = feedsDisabled === '' ? undefined : feedsDisabled;
-  }
-  if (opts.color !== null) {
-    env.NEWSLINE_COLOR_FEED = opts.color === '' ? undefined : opts.color;
-  }
+  setOrClear(env, 'NEWSLINE_FEEDS_DISABLED', feedsDisabled, {
+    transform: normalizeFeedsDisabled,
+  });
+
+  setOrClear(env, 'NEWSLINE_COLOR_FEED', opts.color, {
+    defaultValue: DEFAULT_COLOR_FEED,
+  });
+  setOrClear(env, 'NEWSLINE_LABEL_SEP', opts.separator, {
+    defaultValue: DEFAULT_LABEL_SEP,
+  });
+
   // --no-labels writes '0'. --labels uses the `undefined` sentinel so
   // reconcileEnv clears any existing key and the runtime default (labels on)
-  // takes over. Without the sentinel, `--labels` couldn't undo a prior
-  // `--no-labels` outside the wizard path.
+  // takes over. Two-state boolean doesn't fit setOrClear's three-state shape,
+  // so it stays inline.
   if (opts.showLabels === false)      env.NEWSLINE_SHOW_LABELS = '0';
   else if (opts.showLabels === true)  env.NEWSLINE_SHOW_LABELS = undefined;
-  if (opts.separator !== null) {
-    env.NEWSLINE_LABEL_SEP = opts.separator === '' ? undefined : opts.separator;
-  }
-  if (opts.redditSubs !== null) {
-    if (opts.redditSubs === '') {
-      env.NEWSLINE_REDDIT_SUBS = undefined;
-    } else {
-      const subs = normalizeRedditSubs(opts.redditSubs);
-      if (subs && subs !== DEFAULT_REDDIT_SUB) env.NEWSLINE_REDDIT_SUBS = subs;
-    }
-  }
-  // opts.rotation is normalized to number|''|null by install() — '' skips
-  // validateRotation so the clear sentinel survives into the patch here.
-  if (opts.rotation === '') {
-    env.NEWSLINE_ROTATION_SEC = undefined;
-  } else if (opts.rotation !== null && opts.rotation !== DEFAULT_ROTATION_SEC) {
-    env.NEWSLINE_ROTATION_SEC = String(opts.rotation);
-  }
-  // Motion presets. '' and 'slide' both clear both keys (runtime slide at
-  // SCROLL_SEC=5 is the default). 'static' sets SCROLL=0 and clears
-  // SCROLL_SEC (meaningless when scroll is off — leaving a stray value would
-  // only confuse a user reading their settings.json). 'quick' clears SCROLL
-  // (runtime → 1) and writes SCROLL_SEC=3. null means no motion flag was
-  // passed — leave both keys alone so a non-wizard re-install with other
-  // flags doesn't silently wipe a user's hand-edited SCROLL_SEC.
+
+  setOrClear(env, 'NEWSLINE_REDDIT_SUBS', opts.redditSubs, {
+    transform: normalizeRedditSubs,
+    defaultValue: DEFAULT_REDDIT_SUB,
+  });
+
+  // opts.rotation is number|''|null by the time install() called us.
+  // String(20) === String(DEFAULT_ROTATION_SEC) collapses the explicit-default
+  // case to the delete sentinel.
+  setOrClear(env, 'NEWSLINE_ROTATION_SEC', opts.rotation, {
+    defaultValue: String(DEFAULT_ROTATION_SEC),
+  });
+
+  // Motion is a multi-key fan-out (one preset → two env keys), so it doesn't
+  // fit setOrClear's single-key shape. '' and 'slide' both clear both keys
+  // (runtime slide at SCROLL_SEC=5 is the default). 'static' sets SCROLL=0
+  // and clears SCROLL_SEC (meaningless when scroll is off — leaving a stray
+  // value would only confuse a user reading their settings.json). 'quick'
+  // clears SCROLL (runtime → 1) and writes SCROLL_SEC=3. null means no motion
+  // flag was passed — leave both keys alone so a non-wizard re-install with
+  // other flags doesn't silently wipe a user's hand-edited SCROLL_SEC.
   if (opts.motion !== null) {
     if (opts.motion === '' || opts.motion === 'slide') {
       env.NEWSLINE_SCROLL = undefined;
@@ -966,6 +1103,15 @@ function buildEnvUpdates(opts) {
 // built-ins and user-plugin names the wizard will render as checkboxes —
 // defaults to ALL_FEEDS for callers (and tests) that don't need to see
 // user feeds.
+// Predicate mirror of validateColor — returns true for any color string the
+// installer would accept (palette, named SGR, raw SGR). Lets the wizard keep
+// a hand-edited NEWSLINE_COLOR_FEED across a reconfigure even when the
+// user's choice (e.g. "38;5;208") isn't in the curated colorChoices list.
+function isAcceptedColor(name) {
+  if (!name) return false;
+  return NAMED_COLORS.includes(name) || RAW_SGR_REGEX.test(name);
+}
+
 function wizardInitialValues(currentEnv, rotationOptions, separatorOptions, availableFeeds) {
   const env = currentEnv || {};
   const feeds = availableFeeds && availableFeeds.length ? availableFeeds : ALL_FEEDS;
@@ -992,7 +1138,11 @@ function wizardInitialValues(currentEnv, rotationOptions, separatorOptions, avai
   return {
     feeds: initialFeeds.length ? initialFeeds : feeds,
     redditSubs: env.NEWSLINE_REDDIT_SUBS || DEFAULT_REDDIT_SUB,
-    color: NAMED_COLORS.includes(env.NEWSLINE_COLOR_FEED) ? env.NEWSLINE_COLOR_FEED : 'amber',
+    // Accept any color validateColor would accept — palette, named SGR, raw
+    // SGR. The runWizard caller injects whatever value comes back here into
+    // colorChoices when not already there, so a hand-edited "38;5;208" pre-
+    // selects correctly instead of silently reverting to amber.
+    color: isAcceptedColor(env.NEWSLINE_COLOR_FEED) ? env.NEWSLINE_COLOR_FEED : 'amber',
     showLabels: env.NEWSLINE_SHOW_LABELS !== '0',
     separator: separatorOptions.includes(env.NEWSLINE_LABEL_SEP) ? env.NEWSLINE_LABEL_SEP : ' \u2022 ',
     rotation: rotationKnown ? rotationN : DEFAULT_ROTATION_SEC,
@@ -1035,7 +1185,22 @@ async function runWizard(opts, currentEnv = {}) {
   const ROTATION_OPTIONS = Number.isFinite(envRotation) && envRotation > 0 && !BASE_ROTATION_OPTIONS.includes(envRotation)
     ? [...BASE_ROTATION_OPTIONS, envRotation].sort((a, b) => a - b)
     : BASE_ROTATION_OPTIONS;
-  const SEPARATOR_OPTIONS = [' \u2022 ', ' \u203a ', ' \u00b7 ', ' \u2014 '];
+  // Separator + color injection mirrors the rotation pattern: a hand-edited
+  // NEWSLINE_LABEL_SEP / NEWSLINE_COLOR_FEED that's a non-default value gets
+  // appended to the option list so Enter-throughs preserve the user's choice
+  // instead of silently rewriting it back to a curated default.
+  const BASE_SEPARATOR_OPTIONS = [' \u2022 ', ' \u203a ', ' \u00b7 ', ' \u2014 '];
+  // Inject the runtime default if it isn't already in the curated list — a
+  // future statusline.sh default change shouldn't make fresh-install users
+  // unable to see the actual default in the picker.
+  const baseSeparatorWithRuntime = BASE_SEPARATOR_OPTIONS.includes(DEFAULT_LABEL_SEP)
+    ? BASE_SEPARATOR_OPTIONS
+    : [DEFAULT_LABEL_SEP, ...BASE_SEPARATOR_OPTIONS];
+  const envSep = currentEnv && typeof currentEnv.NEWSLINE_LABEL_SEP === 'string'
+    ? currentEnv.NEWSLINE_LABEL_SEP : null;
+  const SEPARATOR_OPTIONS = envSep && !baseSeparatorWithRuntime.includes(envSep)
+    ? [...baseSeparatorWithRuntime, envSep]
+    : baseSeparatorWithRuntime;
 
   // User plugins dropped into the feeds dir appear in the wizard checkbox
   // alongside built-ins. scanUserFeeds() silently skips files whose names
@@ -1079,15 +1244,31 @@ async function runWizard(opts, currentEnv = {}) {
 
   // Palette entries are derived from PALETTE (i.e. from colors.sh) so adding
   // a color to the sh side automatically appears here. The appended non-
-  // palette rows are a curated picks of ANSI_BY_NAME names + "none".
+  // palette rows are a curated picks of ANSI_BY_NAME names + "none". A hand-
+  // edited NEWSLINE_COLOR_FEED that isn't already represented (e.g. a raw
+  // SGR like "38;5;208" or a named SGR not in our curated extras) gets a
+  // "Current setting" row prepended so it pre-selects and survives Enter-
+  // through — same intent as the SEPARATOR_OPTIONS injection above.
   const titleCase = s => s.charAt(0).toUpperCase() + s.slice(1);
-  const colorChoices = [
+  const curatedColorChoices = [
     ...Object.keys(PALETTE).map(k => [titleCase(k), k]),
     ['Bold white',  'bold_white'],
     ['Dim yellow',  'dim_yellow'],
     ['Dim (faded)', 'dim'],
     ['No color',    'none'],
   ];
+  // Same drift-prevention as the separator list: if a future runtime default
+  // isn't in the curated picks, prepend it labeled "Runtime default" so
+  // fresh-install users see the actual default.
+  const curatedColorValues = new Set(curatedColorChoices.map(([, v]) => v));
+  const baseColorChoices = curatedColorValues.has(DEFAULT_COLOR_FEED)
+    ? curatedColorChoices
+    : [[`Runtime default (${DEFAULT_COLOR_FEED})`, DEFAULT_COLOR_FEED], ...curatedColorChoices];
+  const envColor = currentEnv && currentEnv.NEWSLINE_COLOR_FEED;
+  const baseColorValues = new Set(baseColorChoices.map(([, v]) => v));
+  const colorChoices = isAcceptedColor(envColor) && !baseColorValues.has(envColor)
+    ? [[`Current setting (${envColor})`, envColor], ...baseColorChoices]
+    : baseColorChoices;
 
   // One combined step for "what does each headline look like?" — the prior
   // two-step flow (show-label? then separator?) made the user answer a config
@@ -1096,13 +1277,12 @@ async function runWizard(opts, currentEnv = {}) {
   //
   // The sentinel `__bare__` means "no label" (same as showLabels=false). Any
   // other value is the separator string itself. This lets one select carry
-  // both decisions without smuggling a second form field through clack.
+  // both decisions without smuggling a second form field through clack. Built
+  // from SEPARATOR_OPTIONS so a hand-edited separator (injected above) shows
+  // up here verbatim.
   const HEADLINE_FORMAT_OPTIONS = [
     { label: 'Just the title', value: '__bare__' },
-    { label: `HN \u2022 Title`, value: ' \u2022 ' },
-    { label: `HN \u203a Title`, value: ' \u203a ' },
-    { label: `HN \u00b7 Title`, value: ' \u00b7 ' },
-    { label: `HN \u2014 Title`, value: ' \u2014 ' },
+    ...SEPARATOR_OPTIONS.map(s => ({ label: `HN${s}Title`, value: s })),
   ];
   const initialFormat = initial.showLabels ? initial.separator : '__bare__';
 
@@ -1351,47 +1531,20 @@ async function runWizard(opts, currentEnv = {}) {
   return { ran: true, clack };
 }
 
-// Proceed confirmation for interactive installs. Flag-driven paths (no wizard)
-// always pass `clack=null` and lazy-load the module here. The wizard path passes
-// its already-loaded module so the confirm lands inside the same vertical-bar UI
-// instead of starting a fresh intro/outro block. `--yes` paths bypass this
-// entirely. isCancel → exit 0 matches clack's documented Ctrl-C pattern
-// (user-initiated, not an error). A missing @clack/prompts (source-checkout
-// without `npm install`) degrades to "re-run with --yes" — same graceful
-// fallback as runWizard.
-async function confirmProceed(clack) {
-  if (!clack) {
-    try {
-      clack = await import('@clack/prompts');
-    } catch (_) {
-      console.error('\nError: @clack/prompts not available; cannot prompt for confirmation.');
-      console.error('Re-run with --yes (or -y) to skip the prompt, or `npm install` to restore it.');
-      return false;
-    }
-  }
-  const result = await clack.confirm({
-    message: 'Apply these changes?',
-    active: 'Install',
-    inactive: 'Cancel',
-    initialValue: true,
-  });
-  if (clack.isCancel(result)) {
-    clack.cancel('Aborted.');
-    process.exit(0);
-  }
-  return result;
-}
 
 // All filesystem paths install/uninstall touch. One place so the two
 // functions can't disagree about "where does claude-newsline live".
 function installPaths() {
   const cfgDir = configDir();
   const cacheFile = path.join(cfgDir, 'cache', 'feed-titles.txt');
-  // User-feeds directory — statusline.sh defaults to this path via
-  // ${NEWSLINE_FEEDS_DIR:-$CONFIG_DIR/claude-newsline/feeds}. Both sides
-  // must agree; the default is canonical here so tests that stub the
-  // installer path also exercise the runtime default.
-  const userFeedsDir = path.join(cfgDir, 'claude-newsline', 'feeds');
+  // User-feeds directory — statusline.sh resolves
+  // ${NEWSLINE_FEEDS_DIR:-$CONFIG_DIR/claude-newsline/feeds} at runtime.
+  // Honor the same override here so --new-feed scaffolds into the right
+  // place, --list-feeds scans the right directory, and the wizard's
+  // user-plugin checkbox sees what the runtime will actually load. Without
+  // this the installer wrote files the runtime never reads.
+  const userFeedsDir = process.env.NEWSLINE_FEEDS_DIR
+    || path.join(cfgDir, 'claude-newsline', 'feeds');
   return {
     cfgDir,
     settingsPath:     path.join(cfgDir, 'settings.json'),
@@ -1641,28 +1794,87 @@ function isSettingsNoop(plan) {
   return true;
 }
 
-// Abstracts "how do we render a status line of install output" so
-// describePlan/applyPlan can emit through clack's log.* (vertical-bar UI,
-// when the wizard ran) or plain console.log (flag-driven paths without
-// clack loaded). Same call sites, same output ordering — only the glyphs
-// differ. `clack` is the module returned by runWizard, or null.
-function createUILogger(clack) {
-  if (clack) {
+// Single abstraction for installer output and prompts. Two backends:
+//
+//   - "wizard" mode (clack is loaded; the user came in via runWizard) renders
+//     into clack's vertical-bar log.* / tasks() flow so describePlan,
+//     applyPlan, and the proceed-confirm sit inside one continuous UI.
+//   - "plain" mode (no clack) prints to console with minimal styling. Used
+//     by flag-driven paths and the source-checkout fallback when
+//     @clack/prompts isn't installed.
+//
+// confirm() lazy-loads clack on first call so flag-driven paths don't pay
+// for the import unless they actually need to prompt; --yes / non-TTY
+// paths short-circuit before reaching here. A failed lazy-load surfaces
+// a clear "install --yes or npm install" message instead of crashing.
+//
+// confirm() returns a boolean; user-cancels (Ctrl-C / Esc) exit the
+// process with status 0, matching clack's documented pattern (cancel is
+// user-initiated, not an error, so no traceback or non-zero exit).
+function createUILogger(initialClack) {
+  let clack = initialClack || null;
+  const isWizard = !!initialClack;
+
+  // Resolve clack on demand for prompts (confirm). The wizard mode
+  // already has it loaded; flag mode loads on first use.
+  const ensureClack = async () => {
+    if (clack) return clack;
+    try {
+      clack = await import('@clack/prompts');
+      return clack;
+    } catch (_) {
+      return null;
+    }
+  };
+
+  if (isWizard) {
     return {
+      isWizard,
       warn:    (s) => clack.log.warn(s),
       step:    (s) => clack.log.step(s),
       success: (s) => clack.log.success(s),
       message: (s) => clack.log.message(s),
-      // Present only on the clack path so applyPlan can feature-detect and
-      // fall back to a flat sequential render when tasks() isn't available.
       tasks:   (list) => clack.tasks(list),
+      cancel:  (s) => clack.cancel(s),
+      outro:   (s) => clack.outro(s),
+      async confirm(message) {
+        const c = await ensureClack();
+        const result = await c.confirm({
+          message,
+          active: 'Install',
+          inactive: 'Cancel',
+          initialValue: true,
+        });
+        if (c.isCancel(result)) { c.cancel('Aborted.'); process.exit(0); }
+        return result;
+      },
     };
   }
+
   return {
+    isWizard,
     warn:    (s) => console.log(`\x1b[33m${s}\x1b[0m`),
     step:    (s) => console.log(s),
     success: (s) => console.log(`\u2713 ${s}`),
     message: (s) => console.log(s),
+    cancel:  (s) => console.log(s),
+    outro:   (s) => console.log(`\nDone. ${s}`),
+    async confirm(message) {
+      const c = await ensureClack();
+      if (!c) {
+        console.error('\nError: @clack/prompts not available; cannot prompt for confirmation.');
+        console.error('Re-run with --yes (or -y) to skip the prompt, or `npm install` to restore it.');
+        return false;
+      }
+      const result = await c.confirm({
+        message,
+        active: 'Install',
+        inactive: 'Cancel',
+        initialValue: true,
+      });
+      if (c.isCancel(result)) { c.cancel('Aborted.'); process.exit(0); }
+      return result;
+    },
   };
 }
 
@@ -1812,13 +2024,13 @@ async function install(opts) {
   }
 
   // Interactive wizard on fresh TTY installs only. --yes, non-TTY, and any
-  // explicit config flag keep the flag-driven path so scripts and CI
-  // never hit a hung stdin waiting for input. The wizard also returns the
-  // loaded @clack/prompts module so the rest of install() can render
-  // through the same UI (log.*, outro) — one continuous clack flow from
-  // intro to final success.
+  // explicit config flag keep the flag-driven path so scripts and CI never
+  // hit a hung stdin waiting for input. runWizard returns the loaded
+  // @clack/prompts module to wrap into a UI logger, so describePlan,
+  // applyPlan, and the proceed-confirm all render inside the same vertical-
+  // bar flow.
   let wizardRan = false;
-  let clack = null;
+  let wizardClack = null;
   // Read once. The wizard pre-fills from settings.env; planInstall consumes
   // the same object. A re-run is a reconfigure, not a reset.
   const settings = readSettings(paths.settingsPath);
@@ -1830,7 +2042,7 @@ async function install(opts) {
   if (!opts.yes && process.stdin.isTTY && !ciEnv && !hasExplicitConfig(opts)) {
     const r = await runWizard(opts, settings.env || {});
     wizardRan = r.ran;
-    clack = r.clack;
+    wizardClack = r.clack;
   }
 
   validateFeeds(opts.disable);
@@ -1846,19 +2058,16 @@ async function install(opts) {
   opts.motion = validateMotion(opts.motion);
 
   const plan = planInstall(opts, paths, settings, wizardRan);
-  const ui = createUILogger(clack);
+  const ui = createUILogger(wizardClack);
   describePlan(plan, ui);
 
-  // Confirmation gate. Three paths converge here:
-  //   1. --yes            → skip entirely (unchanged contract).
-  //   2. flag path, TTY   → lazy-load clack and prompt (unchanged contract).
-  //   3. wizard path      → reuse the wizard's clack module and prompt AFTER
-  //                         describePlan, so the preview the user saw inside
-  //                         the wizard is now joined by the concrete diff
-  //                         against settings.json. Skip when the plan is a
-  //                         no-op — nothing to confirm and an extra Y/N beat
-  //                         would just read as friction.
-  //
+  // Confirmation gate. Three paths:
+  //   1. --yes            → skip entirely.
+  //   2. flag path, TTY   → ui.confirm() lazy-loads clack and prompts.
+  //   3. wizard path      → ui.confirm() reuses the wizard's clack module so
+  //                         the prompt sits inside the same vertical-bar UI.
+  //                         Skip when the plan is a no-op — nothing to
+  //                         confirm and an extra Y/N beat reads as friction.
   // The non-TTY / CI branch only fires on flag-driven runs: a wizard can't
   // have happened without a TTY, so wizardRan implies it's safe to prompt.
   if (!opts.yes) {
@@ -1869,30 +2078,30 @@ async function install(opts) {
         console.error('Re-run with --yes (or -y) to skip the confirmation prompt.');
         return 1;
       }
-      const ok = await confirmProceed(null);
-      if (!ok) { console.log('Aborted.'); return 1; }
+      const ok = await ui.confirm('Apply these changes?');
+      // Pick-Cancel returns 0 to match Ctrl-C (which clack handles via its
+      // own process.exit(0) in confirm()). Both are user-initiated declines;
+      // returning different exit codes here used to make CI scripts that
+      // pipe input flake based on which key the user happened to hit.
+      if (!ok) { ui.cancel('Aborted.'); return 0; }
     } else if (!isSettingsNoop(plan)) {
-      const ok = await confirmProceed(clack);
-      if (!ok) {
-        clack.cancel('Aborted.');
-        return 1;
-      }
+      const ok = await ui.confirm('Apply these changes?');
+      // Pick-Cancel returns 0 to match Ctrl-C (which clack handles via its
+      // own process.exit(0) in confirm()). Both are user-initiated declines;
+      // returning different exit codes here used to make CI scripts that
+      // pipe input flake based on which key the user happened to hit.
+      if (!ok) { ui.cancel('Aborted.'); return 0; }
     }
   }
 
   await applyPlan(plan, paths, ui);
-  // On the wizard path, a terminal `log.success` before `outro` gives the
+  // On the wizard path, a terminal success line before outro gives the
   // vertical-bar UI a clear "done" beat separate from the reload hint —
   // outro collapses the gutter, so a success line inside the flow reads
-  // better than stuffing both pieces of info into outro itself. On the
-  // flag path, one plain console.log keeps the prior visual.
+  // better than stuffing both pieces of info into outro itself.
   const doneMsg = 'Restart Claude Code (or start a new session) to see the headline.';
-  if (clack) {
-    clack.log.success('Installed.');
-    clack.outro(doneMsg);
-  } else {
-    console.log(`\nDone. ${doneMsg}`);
-  }
+  if (ui.isWizard) ui.success('Installed.');
+  ui.outro(doneMsg);
   return 0;
 }
 
@@ -2135,16 +2344,31 @@ function listFeeds(verbose) {
     });
   }
 
-  // Plain-list format of the incompat block is reused between verbose and
-  // non-verbose paths — builds lines like:
-  //   future.sh  (declares api=99, runtime supports up to 1)
-  // Returns an array of ready-to-print lines so callers control spacing.
-  const renderIncompatLines = () => incompatFeeds.map((f) => {
+  // One-liner reason per incompat row. Renders the specific cause inline so
+  // the user doesn't have to map a generic footer back to each row's case.
+  // Returns { line, hint } per row — hint is a short fix suggestion (or null
+  // when nothing useful can be said).
+  const renderIncompat = (f) => {
     if (f.compat.reason === 'api') {
-      return `  ${f.name}  (declares api=${f.compat.declaredApi}, runtime supports up to ${f.compat.runtimeApi})`;
+      return {
+        line: `  ${f.name}  (declares api=${f.compat.declaredApi}, runtime supports up to ${f.compat.runtimeApi})`,
+        hint: `    fix: upgrade claude-newsline, or edit ${f.path} to declare api=${f.compat.runtimeApi} or lower`,
+      };
     }
-    return `  ${f.name}  (${f.compat.reason})`;
-  });
+    if (/not defined in file/.test(f.compat.reason)) {
+      return {
+        line: `  ${f.name}  (${f.compat.reason})`,
+        hint: `    fix: add a \`feed_${f.name}() { … }\` definition to ${f.path}`,
+      };
+    }
+    if (/^unreadable/.test(f.compat.reason)) {
+      return {
+        line: `  ${f.name}  (${f.compat.reason})`,
+        hint: `    fix: chmod a+r ${f.path} (or remove if it shouldn't be a plugin)`,
+      };
+    }
+    return { line: `  ${f.name}  (${f.compat.reason})`, hint: null };
+  };
 
   if (!verbose) {
     console.log('Built-in feeds:');
@@ -2171,11 +2395,11 @@ function listFeeds(verbose) {
     if (incompatFeeds.length) {
       console.log('');
       console.log('⚠ Incompatible plugins (not loaded):');
-      for (const line of renderIncompatLines()) console.log(line);
-      console.log('');
-      console.log('These files are in your feeds dir but declare an api version');
-      console.log('newer than this runtime supports. Upgrade claude-newsline or');
-      console.log('edit the plugin to declare a supported api=.');
+      for (const f of incompatFeeds) {
+        const { line, hint } = renderIncompat(f);
+        console.log(line);
+        if (hint) console.log(hint);
+      }
     }
     return 0;
   }
@@ -2211,16 +2435,19 @@ function listFeeds(verbose) {
     }
   }
   // Same incompat block as the non-verbose path, rendered under a trailing
-  // group header so it sits after all loadable-category groups. Re-uses
-  // renderIncompatLines for line-shape parity.
+  // group header so it sits after all loadable-category groups.
   if (incompatFeeds.length) {
     console.log('[⚠ Incompatible — not loaded]');
     for (const f of incompatFeeds) {
       console.log(`  ${f.name}  [user: ${f.path}]`);
       if (f.compat.reason === 'api') {
         console.log(`    reason       declares api=${f.compat.declaredApi}, runtime supports up to ${f.compat.runtimeApi}`);
+        console.log(`    fix          upgrade claude-newsline, or edit the plugin to declare api=${f.compat.runtimeApi} or lower`);
       } else {
         console.log(`    reason       ${f.compat.reason}`);
+        if (/not defined in file/.test(f.compat.reason)) {
+          console.log(`    fix          add a feed_${f.name}() { … } definition`);
+        }
       }
       // Still show the plugin's self-reported description/version so the
       // user can identify which file this is without opening it.
@@ -2293,4 +2520,6 @@ module.exports = {
   MARKER_VAR,
   MARKER_VALUE,
   MAX_BACKUPS,
+  escapeRegex,
+  listBackups,
 };

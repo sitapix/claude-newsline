@@ -8,7 +8,12 @@
 
 <a href="demo/demo.gif"><img src="demo/demo.gif" alt="claude-newsline rotating through Hacker News, Lobsters, and r/programming headlines in the Claude Code status line"></a>
 
-A rotating news ticker for your [Claude Code](https://claude.com/claude-code) status line. Hacker News, r/programming, and Lobsters are on by default. Point it at anything else with a few lines of shell. Your existing `statusLine` stays put and this runs after it. Cmd-click (or Ctrl-click) any headline to open the story.
+A rotating news ticker for your [Claude Code](https://claude.com/claude-code) status line. Hacker News, r/programming, and Lobsters are on by default. Point it at anything else with a few lines of shell. Your existing `statusLine` stays put and this runs after it. Cmd-click (or Ctrl-click) any headline to open the story (terminal must support [OSC 8](#terminals); macOS Terminal.app doesn't, the runtime detects it).
+
+- Rotates Hacker News, Reddit, and Lobsters in one slot. Bring your own RSS or JSON feed in `~/.claude/claude-newsline/feeds/`
+- Stepped horizontal scroll between headlines, configurable or off
+- Idempotent installer: re-running won't double-append, won't clobber your existing `statusLine`
+- Wizard for first-time setup; every prompt is also a flag for CI and dotfiles
 
 ## Install
 
@@ -21,22 +26,67 @@ Shows what it'll change in `~/.claude/settings.json`, asks once, writes. Re-runn
 ```bash
 npx @sitapix/claude-newsline --only hn               # keep just one feed
 npx @sitapix/claude-newsline --disable reddit        # drop one
-npx @sitapix/claude-newsline --color bold_magenta    # name, raw SGR, or "none"
+npx @sitapix/claude-newsline --color amber           # palette name, named SGR, raw SGR, or "none"
+npx @sitapix/claude-newsline --separator " | "       # what sits between label and title
+npx @sitapix/claude-newsline --no-labels             # render just the headline
+npx @sitapix/claude-newsline --reddit-subs rust,golang,mawburn/techsubs
 npx @sitapix/claude-newsline --rotation 30           # seconds per headline (default 20)
 npx @sitapix/claude-newsline --motion static         # just switch, no scroll (also: slide, quick)
-npx @sitapix/claude-newsline --yes                   # skip the prompt (CI)
+npx @sitapix/claude-newsline --list-feeds -v         # show built-ins + user plugins with metadata
+npx @sitapix/claude-newsline --test-feed hn          # one fetch cycle, print URL/HTTP/jq diagnostics
+npx @sitapix/claude-newsline --new-feed nyt          # scaffold a starter plugin and exit
+npx @sitapix/claude-newsline --yes                   # skip the prompt (CI / non-TTY)
 npx @sitapix/claude-newsline --uninstall
+npx @sitapix/claude-newsline --help                  # full flag reference
 ```
 
 `CLAUDE_CONFIG_DIR` is honored if set.
 
 Reddit rate-limits anonymous JSON. When a refresh tick gets a 429, that feed sits out until the next one and the last good cache line keeps showing. More subs in `--reddit-subs` means more requests per refresh, which is why the 15-entry cap exists.
 
+## Tuning
+
+Override any of these via env (shell profile or `settings.json` under `"env"`). All user-facing env vars are namespaced with `NEWSLINE_` so they can't collide with host-shell vars (`PREFIX`, `CACHE_FILE`, and `SCROLL` are generic enough to belong to other tools):
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `NEWSLINE_FEEDS_DISABLED` | (none) | Comma-separated feeds to skip. Whitespace around entries is tolerated, so `reddit, lobsters` and `reddit,lobsters` behave identically. |
+| `NEWSLINE_FEEDS_DIR` | `$CLAUDE_CONFIG_DIR/claude-newsline/feeds` | Where the runtime looks for user plugins. The installer (`--new-feed`, `--list-feeds`, the wizard) honors the same override, so a dotfiles-pinned feeds directory stays consistent across both sides. |
+| `NEWSLINE_REDDIT_SUBS` | `programming` | Comma-separated reddit entries. See `--reddit-subs` for the three accepted shapes. Capped at 15. |
+| `NEWSLINE_CACHE_CHUNK` | `1` | Lines per feed per round-robin pass when building the cache. Default `1` strictly alternates sources (HN, Reddit, Lobsters, HN, …); higher values cluster same-source entries together. |
+| `NEWSLINE_ROTATION_SEC` | `20` | Seconds per headline |
+| `NEWSLINE_SCROLL` | `1` | Set to `0` to disable the scroll transition |
+| `NEWSLINE_SCROLL_SEC` | `5` | Scroll duration in frames (Claude Code refreshes at 1 FPS, so the scroll is always a stepped slide: N discrete frames, not a smooth glide) |
+| `NEWSLINE_REFRESH_SEC` | `600` | How often feeds are re-fetched |
+| `NEWSLINE_MAX_TITLE` | `80` | Truncation point (bytes). ASCII = 1 byte/col, CJK ≈ 3 bytes/2 cols, so this is ≈80 cols for English and ≈48 cols for Japanese. |
+| `NEWSLINE_COLOR_FEED` | `dim_yellow` (runtime fallback) / `amber` (wizard-written) | Truecolor palette (`amber`, `coral`, `pink`, `mint`, `sky`, `lavender`, `lime`), named SGR (`bold_magenta`, `dim_cyan`, …), raw SGR (`38;5;208`), or `none`. Palette entries adapt to the terminal's color depth. |
+| `NEWSLINE_PREFIX` | `Ξ ` | Brand glyph rendered to the left of every headline (set `""` to disable) |
+| `NEWSLINE_COLOR_PREFIX` | `dim` | Color for the prefix glyph |
+| `NEWSLINE_SHOW_LABELS` | `1` | Set to `0` to hide the source label (just the title) |
+| `NEWSLINE_LABEL_SEP` | ` • ` | Separator between label and title |
+| `NEWSLINE_HYPERLINKS` | `auto` | `always` / `never` / `auto` |
+| `NEWSLINE_USER_AGENT` | `claude-newsline/1.0 (+https://github.com/sitapix/claude-newsline)` | UA string `curl` sends on every feed fetch. Override when a source rejects the default, or to identify your own deployment. |
+| `NEWSLINE_DEBUG` | `0` | Set to `1` to dump the loaded-feeds map, plugin metadata, and resolved config to stdout, then exit before rendering. Pipe to a file for bug reports. |
+
+Scroll smoothness is capped by `statusLine.refreshInterval`. Claude Code's minimum is 1 second (1 FPS). The installer sets it to `1` unless you already have one. At 1 FPS a 5s scroll is 5 discrete frames, which reads as a stepped slide rather than a smooth glide.
+
+### Precedence
+
+Config is resolved in the standard dotenv order, highest to lowest:
+
+1. Shell environment (anything exported in `~/.zshrc`, `~/.bashrc`, your CI runner, etc.)
+2. `settings.json` under `"env"` (what the installer writes)
+3. Script default (the fallback baked into `statusline.sh`)
+
+Shell env wins on the theory that the deploy environment knows more than the app does. Same ordering as [motdotla/dotenv](https://github.com/motdotla/dotenv) and Docker Compose. If something isn't applying the way you expect, run `NEWSLINE_DEBUG=1 bash ~/.claude/claude-newsline.sh` to see every knob's resolved value and where it came from.
+
 ## Add your own feed
 
 Drop a `<name>.sh` file in `~/.claude/claude-newsline/feeds/` and it joins the rotation. The runtime globs the directory on every refresh, so new plugins show up on the next tick without a rebuild or a reinstall. Filename maps to function name: `nyt.sh` must define `feed_nyt()`.
 
 > **Trust boundary.** Every refresh sources plugins in this directory as shell code. Same trust model as a dotfile or a `~/.zshrc` include. Audit third-party plugins before dropping them in, and don't chmod the directory world-writable. If a plugin fails to load, `NEWSLINE_DEBUG=1` reports it under `user feeds skipped:` with the source error.
+>
+> The `api=` declaration is a registration filter, not a sandbox: a plugin declaring `api=` higher than the runtime supports doesn't get added to the rotation, but its top-level shell code still runs when the file is sourced. Treat untrusted plugins as you would any third-party shell snippet on your system regardless of `api=`.
 
 Minimal JSON feed:
 
@@ -83,7 +133,7 @@ With no `JQ` declared, the default filter is `.[] | [$default, .title, .link] | 
 JQ='.[] | select(.description | test("sponsored"; "i") | not) | [$default, .title, .link] | @tsv'
 ```
 
-`xml-to-json` picks `<link>url</link>` (RSS) or the `href` attribute of `<link .../>` (Atom), decodes HTML entities (`&amp;` → `&`, `&#8217;` → `'`), and unwraps CDATA. RSS `<description>` and Atom `<summary>` both map to the `description` key, so one jq filter handles either. Declare `api=2` in `FEED_META` so older runtimes skip the plugin cleanly instead of calling a branch they don't understand.
+`xml-to-json` picks `<link>url</link>` (RSS) or the `href` attribute of `<link .../>` (Atom), decodes HTML entities outside CDATA (`&amp;` → `&`, `&#8217;` → `'`), and unwraps CDATA blocks. CDATA content itself is preserved verbatim per the XML spec, so a literal `</item>` or a literal `&amp;` inside CDATA survives unchanged — the parser can't be fooled by either. RSS `<description>` and Atom `<summary>` both map to the `description` key, so one jq filter handles either. Declare `api=2` in `FEED_META` so older runtimes skip the plugin cleanly instead of calling a branch they don't understand.
 
 ### Test a feed before you trust it
 
@@ -167,39 +217,6 @@ user feeds dir:   /Users/you/.claude/claude-newsline/feeds
 Files that fail to source, don't define the expected `feed_<name>` function, or have a filename that isn't a legal shell identifier (leading digit, hyphen) are skipped silently. The rest of the rotation keeps working. Filename validation is `[A-Za-z_][A-Za-z0-9_]*`.
 
 jq sandboxes the filter (no filesystem, no network). The shell function runs inline with `statusline.sh` and has the same trust level as anything else in `~/.claude/`, so don't source `.sh` files you haven't read. The runtime validates URLs the jq filter emits at render time: anything that isn't `http://` or `https://` still rotates into view but does not get a clickable OSC 8 hyperlink (defense against terminal URL-handler argument injection, e.g. CVE-2023-46321).
-
-## Tuning
-
-Override any of these via env (shell profile or `settings.json` under `"env"`). All user-facing env vars are namespaced with `NEWSLINE_` so they can't collide with host-shell vars (`PREFIX`, `CACHE_FILE`, and `SCROLL` are generic enough to belong to other tools):
-
-| Variable | Default | Effect |
-| --- | --- | --- |
-| `NEWSLINE_FEEDS_DISABLED` | (none) | Comma-separated feeds to skip |
-| `NEWSLINE_REDDIT_SUBS` | `programming` | Comma-separated reddit entries. See `--reddit-subs` for the three accepted shapes. Capped at 15. |
-| `NEWSLINE_CACHE_CHUNK` | `1` | Lines per feed per round-robin pass when building the cache. Default `1` strictly alternates sources (HN, Reddit, Lobsters, HN, …); higher values cluster same-source entries together. |
-| `NEWSLINE_ROTATION_SEC` | `20` | Seconds per headline |
-| `NEWSLINE_SCROLL` | `1` | Set to `0` to disable the scroll transition |
-| `NEWSLINE_SCROLL_SEC` | `5` | Scroll duration in frames (Claude Code refreshes at 1 FPS, so the scroll is always a stepped slide: N discrete frames, not a smooth glide) |
-| `NEWSLINE_REFRESH_SEC` | `600` | How often feeds are re-fetched |
-| `NEWSLINE_MAX_TITLE` | `80` | Truncation point (bytes). ASCII = 1 byte/col, CJK ≈ 3 bytes/2 cols, so this is ≈80 cols for English and ≈48 cols for Japanese. |
-| `NEWSLINE_COLOR_FEED` | `dim_yellow` | Color name, raw SGR (`38;5;208`), or `none` |
-| `NEWSLINE_PREFIX` | `Ξ ` | Brand glyph rendered to the left of every headline (set `""` to disable) |
-| `NEWSLINE_COLOR_PREFIX` | `dim` | Color for the prefix glyph |
-| `NEWSLINE_SHOW_LABELS` | `1` | Set to `0` to hide the source label (just the title) |
-| `NEWSLINE_LABEL_SEP` | ` • ` | Separator between label and title |
-| `NEWSLINE_HYPERLINKS` | `auto` | `always` / `never` / `auto` |
-
-Scroll smoothness is capped by `statusLine.refreshInterval`. Claude Code's minimum is 1 second (1 FPS). The installer sets it to `1` unless you already have one. At 1 FPS a 5s scroll is 5 discrete frames, which reads as a stepped slide rather than a smooth glide.
-
-### Precedence
-
-Config is resolved in the standard dotenv order, highest to lowest:
-
-1. Shell environment (anything exported in `~/.zshrc`, `~/.bashrc`, your CI runner, etc.)
-2. `settings.json` under `"env"` (what the installer writes)
-3. Script default (the fallback baked into `statusline.sh`)
-
-Shell env wins on the theory that the deploy environment knows more than the app does. Same ordering as [motdotla/dotenv](https://github.com/motdotla/dotenv) and Docker Compose. If something isn't applying the way you expect, run `NEWSLINE_DEBUG=1 bash ~/.claude/claude-newsline.sh` to see every knob's resolved value and where it came from.
 
 ## Terminals
 

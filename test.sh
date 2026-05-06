@@ -105,6 +105,17 @@ run_statusline() { bash "$STATUSLINE" </dev/null 2>&1; }
 run_cli() { node "$CLI" --yes "$@" </dev/null; }
 run_uninstall() { node "$CLI" --uninstall </dev/null; }
 
+# Bootstrap a baseline install for sections that only inspect post-install
+# state. Idempotent: if the runtime files are already in place from a prior
+# section, no-op. Without this, a narrow RUN_ONLY filter that targets an
+# inspect-only section (e.g. "install copies runtime scripts") would fail
+# because the prior section that ran the install was skipped.
+ensure_installed() {
+  [ -f "$CLAUDE_CONFIG_DIR/claude-newsline.sh" ] && return 0
+  [ -f "$SETTINGS" ] || printf '{}\n' > "$SETTINGS"
+  run_cli >/dev/null 2>&1
+}
+
 # section NAME — begins a test section. When RUN_ONLY is set (as an ERE),
 # only sections whose name matches run; the rest are skipped entirely (no
 # forks, no body execution). Use as: `section "..." && { ...body... }`.
@@ -163,6 +174,20 @@ prime_cache_multi() {
     shift 3
   done
   touch "$CACHE"
+}
+
+# Sections that drive the rotation/scroll math need a `date +%s` mock so
+# FAKE_NOW=… is deterministic. Originally this was set up once in the
+# "multi-feed cache cycles through labels" section and downstream sections
+# inherited it — which broke under narrow RUN_ONLY filters. ensure_fakedate
+# is idempotent: any consumer can call it; the first call seeds the mock,
+# the rest are no-ops. Sets the global $fakedate_dir.
+ensure_fakedate() {
+  [ -n "${fakedate_dir:-}" ] && [ -x "$fakedate_dir/date" ] && return 0
+  make_mock_bin fakedate_dir fakedate date <<'SH'
+#!/bin/sh
+[ "$1" = "+%s" ] && echo "${FAKE_NOW:-0}" || exec /bin/date "$@"
+SH
 }
 
 # -----------------------------------------------------------------------------
@@ -276,10 +301,7 @@ prime_cache_multi \
   "HN"       "Story One"   "https://example.com/1" \
   "r/prog"   "Story Two"   "https://example.com/2" \
   "Lobsters" "Story Three" "https://example.com/3"
-make_mock_bin fakedate_dir fakedate date <<'SH'
-#!/bin/sh
-[ "$1" = "+%s" ] && echo "${FAKE_NOW:-0}" || exec /bin/date "$@"
-SH
+ensure_fakedate
 out=$(FAKE_NOW=0 PATH="$fakedate_dir:$PATH" bash "$STATUSLINE" </dev/null)
 assert_contains "$out" "HN • Story One" "rotation index 0 shows first feed"
 out=$(FAKE_NOW=20 PATH="$fakedate_dir:$PATH" bash "$STATUSLINE" </dev/null)
@@ -289,7 +311,14 @@ assert_contains "$out" "Lobsters • Story Three" "third tick lands on third fee
 
 }
 section "scroll transition between headlines" && {
-# Cache still primed with the 3-line set from the rotation block.
+# Standalone setup so RUN_ONLY=scroll works without the rotation section.
+# ensure_fakedate is idempotent — the rotation section's call wins on a
+# full run, this is just the safety net for narrow filters.
+prime_cache_multi \
+  "HN"       "Story One"   "https://example.com/1" \
+  "r/prog"   "Story Two"   "https://example.com/2" \
+  "Lobsters" "Story Three" "https://example.com/3"
+ensure_fakedate
 # Defaults: ROTATION_SEC=20, SCROLL_SEC=5, dwell=15. FAKE_NOW=5 → pos=5 (dwell
 # window) → static with hyperlink. FAKE_NOW=19 → pos=19, scroll frame 4
 # (final) → next headline visible in window, no hyperlink.
@@ -352,6 +381,7 @@ section "double-buffered cache: refresh is deferred to rotation boundary" && {
 # displayed headline until the next pos_in_cycle=0. Without double-buffering
 # (M3 in the audit), a user watching "Old Story" would suddenly see "New
 # Story" 3 seconds in because refresh_all_feeds overwrote $CACHE directly.
+ensure_fakedate
 prime_cache_multi \
   "HN" "OldOne" "https://example.com/old1" \
   "HN" "OldTwo" "https://example.com/old2"
@@ -463,6 +493,14 @@ assert_contains "$out" $'\e]8;;http://example.com/a' "http:// passes the scheme 
 prime_cache "HN" "HTTPS OK" "https://example.com/b"
 out=$(NEWSLINE_HYPERLINKS=always bash "$STATUSLINE" </dev/null)
 assert_contains "$out" $'\e]8;;https://example.com/b' "https:// passes the scheme guard"
+
+# RFC 3986: schemes are case-insensitive. Legacy Atom feeds occasionally
+# emit HTTP:// / Https:// — the guard should pass them through unchanged.
+for ok_url in 'HTTP://example.com/upper' 'Https://example.com/mixed' 'HTTPS://example.com/all'; do
+  prime_cache "HN" "Case Test" "$ok_url"
+  out=$(NEWSLINE_HYPERLINKS=always bash "$STATUSLINE" </dev/null)
+  assert_contains "$out" $'\e]8;;'"$ok_url" "case-variant '$ok_url' passes the scheme guard"
+done
 
 }
 section "NO_COLOR suppresses all ANSI color output end-to-end" && {
@@ -709,6 +747,50 @@ assert_equals "$err" "" "NEWSLINE_REFRESH_SEC=foo emits no stderr"
 err=$(NEWSLINE_MAX_TITLE=0        bash "$STATUSLINE" </dev/null 2>&1 >/dev/null)
 assert_equals "$err" "" "NEWSLINE_MAX_TITLE=0 emits no stderr"
 
+# Leading-zero values would otherwise trip POSIX `$(( ))` octal parsing on
+# every refresh tick (`$((20 - 008))` → "value too great for base"). guard_num
+# must fold them into the silent-fallback branch.
+for bad in 008 09 0123; do
+  err=$(NEWSLINE_ROTATION_SEC=$bad bash "$STATUSLINE" </dev/null 2>&1 >/dev/null)
+  assert_equals "$err" "" "NEWSLINE_ROTATION_SEC=$bad emits no stderr"
+  err=$(NEWSLINE_SCROLL_SEC=$bad bash "$STATUSLINE" </dev/null 2>&1 >/dev/null)
+  assert_equals "$err" "" "NEWSLINE_SCROLL_SEC=$bad emits no stderr"
+done
+
+}
+section "NEWSLINE_CACHE_CHUNK guards against awk infinite loop on bad values" && {
+# `pos += chunk` with chunk coerced to 0 (empty / non-numeric / "0") would
+# never advance — awk pegs CPU and holds the lock until reaper. guard_num
+# coerces those back to 1, so the cache builds normally and the call returns.
+mkdir -p "$CLAUDE_CONFIG_DIR/cache"
+make_mock_bin chunk_curl chunkcurl curl <<'SH'
+#!/bin/sh
+# Tiny RSS-like JSON for the HN feed; one item is enough for the merge to land.
+url=""; for a in "$@"; do case "$a" in https://*) url="$a" ;; esac; done
+case "$url" in
+  *hn.algolia*) printf '{"hits":[{"title":"Chunk Test","objectID":"42"}]}\n' ;;
+  *)            printf '{}\n' ;;
+esac
+SH
+for bad in 0 abc -1 ''; do
+  rm -f "$CACHE" "$CACHE.pending" "$CACHE.lock"
+  if NEWSLINE_FEEDS_DISABLED="reddit,lobsters" \
+     NEWSLINE_CACHE_CHUNK="$bad" \
+     PATH="$chunk_curl:$PATH" \
+     timeout 5 bash "$STATUSLINE" </dev/null >/dev/null 2>&1; then
+    pass "NEWSLINE_CACHE_CHUNK=${bad:-(empty)} returns within timeout"
+  else
+    fail "NEWSLINE_CACHE_CHUNK=${bad:-(empty)} returns within timeout" "awk-loop hang or non-zero exit"
+  fi
+  wait_for_cache
+  if [ -s "$CACHE" ]; then
+    pass "NEWSLINE_CACHE_CHUNK=${bad:-(empty)} still produced cache content"
+  else
+    fail "NEWSLINE_CACHE_CHUNK=${bad:-(empty)} still produced cache content" "cache empty"
+  fi
+done
+rm -f "$CACHE" "$CACHE.pending" "$CACHE.lock"
+
 }
 section "multi-byte title truncation does not produce U+FFFD replacement char" && {
 # Japanese "日本語テスト" = 18 UTF-8 bytes over 6 codepoints. A byte-cut at
@@ -731,6 +813,7 @@ section "multi-byte title in scroll window emits valid UTF-8 (no orphan bytes)" 
 # pipe through `iconv -f UTF-8 -t UTF-8` (no -c) and require exit 0. This
 # catches the raw-bytes-that-would-render-as-U+FFFD case, which plain
 # string-matching on U+FFFD bytes misses.
+ensure_fakedate
 prime_cache_multi \
   "HN"     "日本語テスト ABC"  "https://example.com/jp1" \
   "r/dev"  "日本語テスト XYZ"  "https://example.com/jp2"
@@ -765,6 +848,7 @@ section "scroll render does not decode literal \\033 bytes in titles (ANSI injec
 # and walks every scroll frame, asserting zero 0x1B bytes are sourced from
 # the title injection. Any regression (a future refactor that goes back to
 # `-v` for these inputs) fails loudly here.
+ensure_fakedate
 prime_cache_multi \
   "HN"     'pre\033[41;97mHIJACK\033[0m post' "https://example.com/poc1" \
   "r/sec"  'next\033[32mX\033[0m'             "https://example.com/poc2"
@@ -958,6 +1042,25 @@ expected=$(printf 'Tom & Jerry: <Chase> \xe2\x80\x94 Don\xe2\x80\x99t')
 assert_equals "$(echo "$out" | jq -r '.[0].title')" "$expected" "named + decimal + hex entities all decode"
 
 }
+section "xml-to-json: numeric and hex entities do NOT over-decode into named" && {
+# Regression: an earlier impl ran three sequential .replace() passes
+# (numeric → hex → named). Input "&#38;lt;" went numeric→"&lt;"→named→"<",
+# losing the literal "&lt;" the feed intended. Same for "&#x26;lt;".
+# Single combined regex pass closes that re-scan window.
+out=$(xml_to_json <<'XML'
+<rss><channel>
+  <item>
+    <title>numeric: &#38;lt; hex: &#x26;gt; mixed: &amp;amp;</title>
+    <link>https://example.com/no-overdecode</link>
+  </item>
+</channel></rss>
+XML
+)
+assert_equals "$(echo "$out" | jq -r '.[0].title')" \
+  "numeric: &lt; hex: &gt; mixed: &amp;" \
+  "&#38;lt; / &#x26;gt; / &amp;amp; each decode exactly once"
+
+}
 section "xml-to-json: strips CDATA in title and link" && {
 out=$(xml_to_json <<'XML'
 <rss><channel>
@@ -970,6 +1073,56 @@ XML
 )
 assert_equals "$(echo "$out" | jq -r '.[0].title')" 'Inside CDATA <with> "html"' "CDATA unwrapped in title"
 assert_equals "$(echo "$out" | jq -r '.[0].link')"  'https://example.com/cdata'  "CDATA unwrapped in link"
+
+}
+section "xml-to-json: CDATA-internal </item> does not truncate parsing" && {
+# Regression guard: pre-fix, ITEM_RE ran on the raw XML, so a non-greedy match
+# stopped at the FIRST literal </item> — even one buried inside CDATA. A
+# single feed item that quoted "</item>" anywhere in CDATA would silently
+# drop every subsequent item from the document. Now CDATA blocks are
+# placeholder-substituted before any regex sees them, and the close-tag
+# inside CDATA can no longer fool the item walker.
+out=$(xml_to_json <<'XML'
+<rss><channel>
+  <item>
+    <title><![CDATA[Story about </item> tags in CDATA]]></title>
+    <link>https://example.com/first</link>
+  </item>
+  <item>
+    <title>Second item must survive</title>
+    <link>https://example.com/second</link>
+  </item>
+</channel></rss>
+XML
+)
+assert_equals "$(echo "$out" | jq 'length')"        "2"                            "both items extracted (CDATA didn't truncate)"
+assert_equals "$(echo "$out" | jq -r '.[0].title')" "Story about </item> tags in CDATA" "CDATA-internal close-tag preserved verbatim"
+assert_equals "$(echo "$out" | jq -r '.[1].title')" "Second item must survive"     "subsequent item still parses"
+assert_equals "$(echo "$out" | jq -r '.[1].link')"  "https://example.com/second"   "subsequent item link still parses"
+
+}
+section "xml-to-json: entities inside CDATA are preserved verbatim (XML spec)" && {
+# Per XML spec, CDATA disables entity processing. The earlier impl unwrapped
+# CDATA at the top level then ran decode() across everything, so a literal
+# &amp; inside CDATA decoded to &, contradicting the feed author's intent.
+# Verbatim restore at field-emit time keeps CDATA content as-is while
+# entities OUTSIDE CDATA still decode normally — both behaviours asserted
+# in one test so a future refactor that re-unifies the paths fails loudly.
+out=$(xml_to_json <<'XML'
+<rss><channel>
+  <item>
+    <title><![CDATA[Tom &amp; Jerry: literal &lt;]]></title>
+    <link>https://example.com/cdata-ent</link>
+  </item>
+  <item>
+    <title>Tom &amp; Jerry: decoded &lt;</title>
+    <link>https://example.com/plain-ent</link>
+  </item>
+</channel></rss>
+XML
+)
+assert_equals "$(echo "$out" | jq -r '.[0].title')" "Tom &amp; Jerry: literal &lt;" "entities inside CDATA stay literal"
+assert_equals "$(echo "$out" | jq -r '.[1].title')" "Tom & Jerry: decoded <"        "entities outside CDATA still decode"
 
 }
 section "xml-to-json: single-line minified XML still parses" && {
@@ -995,6 +1148,46 @@ XML
 assert_equals "$(echo "$out" | jq 'length')"        "2"              "only complete items emitted"
 assert_equals "$(echo "$out" | jq -r '.[0].title')" "Has Both"       "first complete item"
 assert_equals "$(echo "$out" | jq -r '.[1].title')" "Has Both Two"   "second complete item (skipping middle two)"
+
+}
+section "xml-to-json: <link> URLs preserve no-whitespace shape across line wraps" && {
+# Pretty-printed RSS feeds wrap CDATA content. Pre-fix, the `clean()` helper
+# collapsed all whitespace to a single space, so a line-wrapped URL became
+# "https://example.com/a /b" — terminal hyperlink handlers split on the
+# space and the link broke silently. cleanUrl strips whitespace outright.
+out=$(xml_to_json <<'XML'
+<rss><channel>
+  <item>
+    <title>Wrapped URL</title>
+    <link><![CDATA[https://example.com/very/long/path/
+with-line-break]]></link>
+  </item>
+  <item>
+    <title>Atom href Wrap</title>
+    <link href="https://example.com/atom/
+wrapped"/>
+  </item>
+</channel></rss>
+XML
+)
+assert_equals "$(echo "$out" | jq -r '.[0].link')" \
+  "https://example.com/very/long/path/with-line-break" \
+  "<link>CDATA URL strips embedded newline+indent (no space injection)"
+assert_equals "$(echo "$out" | jq -r '.[1].link')" \
+  "https://example.com/atom/wrapped" \
+  "Atom href value strips embedded whitespace too"
+# Titles are still allowed to collapse whitespace — the prior contract.
+out=$(xml_to_json <<'XML'
+<rss><channel>
+  <item>
+    <title>Wrapped
+title</title>
+    <link>https://example.com/t</link>
+  </item>
+</channel></rss>
+XML
+)
+assert_equals "$(echo "$out" | jq -r '.[0].title')" "Wrapped title" "title still collapses whitespace"
 
 }
 section "xml-to-json: normalizes embedded tabs and newlines in fields" && {
@@ -1365,6 +1558,7 @@ assert_equals "$perms" "Bash(*)" "permissions key preserved"
 
 }
 section "install creates statusLine when none existed" && {
+ensure_installed
 type=$(jq -r '.statusLine.type' "$SETTINGS")
 cmd=$(jq -r '.statusLine.command' "$SETTINGS")
 interval=$(jq -r '.statusLine.refreshInterval' "$SETTINGS")
@@ -1389,6 +1583,18 @@ assert_equals "$interval" "5" "existing refreshInterval preserved"
 
 }
 section "install is idempotent (no double-append)" && {
+# Set up the state the prior section established (existing user statusLine
+# + first install) so RUN_ONLY filters can hit this one in isolation. The
+# original first install happened in "install appends to existing
+# statusLine.command" — bootstrap the same shape here on cold runs.
+if ! grep -q 'my-statusline.sh' "$SETTINGS" 2>/dev/null; then
+  cat > "$SETTINGS" <<'JSON'
+{
+  "statusLine": {"type": "command", "command": "bash /usr/local/bin/my-statusline.sh", "refreshInterval": 5}
+}
+JSON
+  run_cli >/dev/null 2>&1
+fi
 run_cli >/dev/null 2>&1
 cmd_after=$(jq -r '.statusLine.command' "$SETTINGS")
 count=$(printf '%s' "$cmd_after" | grep -o 'claude-newsline.sh' | wc -l | tr -d ' ')
@@ -1397,6 +1603,7 @@ assert_contains "$cmd_after" "my-statusline.sh" "user script still preserved aft
 
 }
 section "install copies runtime scripts (statusline.sh, colors.sh, xml-to-json.js)" && {
+ensure_installed
 assert_file_exists "$CLAUDE_CONFIG_DIR/claude-newsline.sh" "claude-newsline.sh installed"
 assert_file_exists "$CLAUDE_CONFIG_DIR/colors.sh"         "colors.sh installed"
 # xml-to-json.js runs at refresh time for FEED_PARSER=xml plugins — must
@@ -1545,6 +1752,28 @@ cat > "$SETTINGS" <<'JSON'
 JSON
 run_cli --rotation 20 >/dev/null 2>&1
 assert_equals "$(jq -r '.env.NEWSLINE_ROTATION_SEC // "unset"' "$SETTINGS")" "unset" "--rotation 20 (default) doesn't clutter .env"
+
+}
+section "--rotation 20 (default) clears a stale prior override" && {
+# Regression: an earlier impl elided the write entirely when the chosen
+# value equaled the runtime default. That left a pre-existing
+# NEWSLINE_ROTATION_SEC=30 in place after the user explicitly passed
+# --rotation 20, so the explicit choice silently did nothing.
+cat > "$SETTINGS" <<'JSON'
+{"env": {"NEWSLINE_ROTATION_SEC": "30"}}
+JSON
+run_cli --rotation 20 >/dev/null 2>&1
+assert_env_gone NEWSLINE_ROTATION_SEC "explicit default clears stale override"
+
+}
+section "--reddit-subs programming (default) clears a stale prior override" && {
+# Same regression class as --rotation: choosing the runtime default must
+# clear a stale .env value, not silently leave it alone.
+cat > "$SETTINGS" <<'JSON'
+{"env": {"NEWSLINE_REDDIT_SUBS": "rust,golang"}}
+JSON
+run_cli --reddit-subs programming >/dev/null 2>&1
+assert_env_gone NEWSLINE_REDDIT_SUBS "explicit default clears stale reddit override"
 
 }
 section "--rotation rejects invalid values" && {
@@ -1837,6 +2066,41 @@ fi
 assert_file_exists "$SETTINGS.bak.$((base_ts + 13))" "newest seed survives pruning"
 
 }
+section "backup prune sorts collision counters numerically (>9 in one second)" && {
+# Lex sort breaks once the collision counter rolls past 9: '.bak.<ts>.10'
+# sorts BEFORE '.bak.<ts>.2' because '1' < '2'. Pre-fix this meant pruning
+# could delete the wrong file when more than 10 backups landed in the same
+# second. Seed a single timestamp with 12 collision-counter siblings, run
+# install, and assert the survivors are the highest counters — not the
+# lex-tail.
+rm -f "$SETTINGS".bak.*
+cat > "$SETTINGS" <<'JSON'
+{"model":"claude-opus-4-7"}
+JSON
+collide_ts=1700100000
+# Seed: .bak.1700100000 (counter 0) plus .bak.1700100000.1 ... .bak.1700100000.11.
+# Total = 12 backups, all "in the same second" from the prune logic's perspective.
+printf '{"seed":0}\n' > "$SETTINGS.bak.$collide_ts"
+for n in 1 2 3 4 5 6 7 8 9 10 11; do
+  printf '{"seed":%s}\n' "$n" > "$SETTINGS.bak.$collide_ts.$n"
+done
+seed_count=$(ls "$SETTINGS".bak.* 2>/dev/null | wc -l | tr -d ' ')
+assert_equals "$seed_count" "12" "seeded 12 collision-counter backups"
+run_cli >/dev/null 2>&1
+max_backups=$(node -e "console.log(require('$CLI').MAX_BACKUPS)")
+final_count=$(ls "$SETTINGS".bak.* 2>/dev/null | wc -l | tr -d ' ')
+assert_equals "$final_count" "$max_backups" "prune keeps exactly MAX_BACKUPS at collision boundary"
+# .bak.<ts>.11 is the chronologically newest seed — it MUST survive. Lex sort
+# would have placed it under .bak.<ts>.2, marked it "old", and deleted it.
+assert_file_exists "$SETTINGS.bak.$collide_ts.11" "highest collision counter survives prune"
+# .bak.<ts> (counter 0) is the oldest — it MUST be gone with 12 → 10 prune.
+if [ -e "$SETTINGS.bak.$collide_ts" ]; then
+  fail "lowest collision counter pruned" "still exists: $SETTINGS.bak.$collide_ts"
+else
+  pass "lowest collision counter pruned"
+fi
+
+}
 section "install emits CLAUDE_NEWSLINE=<ver> marker prefix" && {
 # Ownership marker: installer writes `CLAUDE_NEWSLINE=v1 bash '<path>'` so
 # future installers can identify their own past work by sentinel rather
@@ -1987,6 +2251,56 @@ else
 fi
 post_hash=$(md5 -q "$SETTINGS" 2>/dev/null || md5sum "$SETTINGS" | cut -d' ' -f1)
 assert_equals "$post_hash" "$pre_hash" "non-TTY refusal leaves settings.json untouched"
+
+}
+section "install preserves settings.json file mode (no permission widening)" && {
+# settings.json's `env` block frequently holds API keys. A naive write-then-
+# rename inherits the umask (typically 0o644) and silently widens a security-
+# conscious user's `chmod 600`. writeSettings stat()s the existing file (or
+# the symlink target) and reapplies its mode to the temp file before rename.
+#
+# Reproducer pre-fix: chmod 600 → install → mode is now 644.
+rm -f "$SETTINGS"
+echo '{"model":"claude-opus-4-7"}' > "$SETTINGS"
+chmod 600 "$SETTINGS"
+run_cli >/dev/null 2>&1
+mode=$(stat -c '%a' "$SETTINGS" 2>/dev/null || stat -f '%OLp' "$SETTINGS" 2>/dev/null)
+assert_equals "$mode" "600" "0o600 preserved across install"
+
+# 0o640 — uncommon but legitimate (group-readable, owner-only writable). The
+# preserve path must be byte-faithful, not "normalize to 600".
+chmod 640 "$SETTINGS"
+run_cli >/dev/null 2>&1
+mode=$(stat -c '%a' "$SETTINGS" 2>/dev/null || stat -f '%OLp' "$SETTINGS" 2>/dev/null)
+assert_equals "$mode" "640" "0o640 preserved across install (no normalization)"
+
+# Uninstall round-trips through writeSettings the same way, so the mode
+# must survive that path too. Without this assertion, a fix that handled
+# install but missed uninstall would slip through.
+chmod 600 "$SETTINGS"
+run_uninstall >/dev/null 2>&1
+if [ -f "$SETTINGS" ]; then
+  mode=$(stat -c '%a' "$SETTINGS" 2>/dev/null || stat -f '%OLp' "$SETTINGS" 2>/dev/null)
+  assert_equals "$mode" "600" "0o600 preserved across uninstall"
+fi
+
+# Cleanup: make sure subsequent sections start with a writable settings.json.
+echo '{}' > "$SETTINGS"
+
+}
+section "install on first-touch settings.json defaults to 0o600" && {
+# No prior settings.json (e.g. fresh install on a new machine). writeSettings
+# can't preserve a mode it doesn't have a source for — it must default to a
+# conservative one. settings.json holds env (frequently API keys), so 0o600
+# is the right default; widening to umask would silently expose secrets on
+# multi-user hosts.
+rm -f "$SETTINGS"
+run_cli >/dev/null 2>&1
+mode=$(stat -c '%a' "$SETTINGS" 2>/dev/null || stat -f '%OLp' "$SETTINGS" 2>/dev/null)
+assert_equals "$mode" "600" "fresh-install settings.json defaults to 0o600"
+
+# Restore for downstream sections.
+echo '{}' > "$SETTINGS"
 
 }
 section "install follows a settings.json symlink without replacing it" && {
@@ -2434,10 +2748,17 @@ case "$loadable_block" in
 esac
 assert_contains "$out" "Incompatible plugins"        "Incompatible section surfaces future-api plugin"
 assert_contains "$out" "declares api=99"             "Incompatible block shows declared api"
+# Static parse: a syntax-broken file (`feed_broken( {` — no closing paren)
+# fails the function-definition regex and lands in Incompatible with the
+# same "not defined" reason a missing-function file would. The runtime
+# still surfaces the actual syntax error in NEWSLINE_DEBUG output (sh-side
+# section below); install-time we don't source the file so we can't
+# distinguish "syntax error" from "no function defined" — both are
+# "this file won't load."
 assert_contains "$out" "broken"                      "Incompatible section surfaces syntax-broken plugin"
-assert_contains "$out" "source failed"               "syntax-broken plugin reports source failure"
+assert_contains "$out" "feed_broken() not defined"   "syntax-broken plugin reports as not-defined (static parse)"
 assert_contains "$out" "nofunc"                      "Incompatible section surfaces missing-function plugin"
-assert_contains "$out" "feed_nofunc function not defined" "missing-function plugin reports missing function"
+assert_contains "$out" "feed_nofunc() not defined"   "missing-function plugin reports as not-defined"
 
 # Sh-side (load_user_feeds, via NEWSLINE_DEBUG=1):
 out=$(NEWSLINE_FEEDS_DIR="$api_dir/claude-newsline/feeds" NEWSLINE_DEBUG=1 \
@@ -2578,7 +2899,122 @@ assert_contains "$out" "good"                       "scanAllUserFeeds also inclu
 rm -rf "$incompat_dir"
 
 }
+section "--list-feeds surfaces unreadable plugin files" && {
+# A file the scanner can't read (perms, dangling symlink) used to be
+# silently dropped — neither the loadable list nor the Incompatible
+# section mentioned it. The runtime's load_user_feeds would surface a
+# source failure via NEWSLINE_DEBUG=1, so the installer side was the
+# inconsistency. Now it lands in Incompatible with a chmod hint.
+unreadable_dir="$SANDBOX/cfg-unreadable"
+rm -rf "$unreadable_dir"
+mkdir -p "$unreadable_dir/claude-newsline/feeds"
+cat > "$unreadable_dir/claude-newsline/feeds/secret.sh" <<'SH'
+feed_secret() { LABEL='S'; URL='https://x'; JQ='.'; }
+SH
+chmod 0 "$unreadable_dir/claude-newsline/feeds/secret.sh"
+out=$(CLAUDE_CONFIG_DIR="$unreadable_dir" node "$CLI" --list-feeds 2>&1)
+status=$?
+assert_equals "$status" "0"                              "--list-feeds doesn't crash on unreadable plugin"
+assert_contains "$out" "Incompatible plugins"            "unreadable plugin shows under Incompatible"
+assert_contains "$out" "secret"                          "unreadable plugin name surfaces"
+assert_contains "$out" "unreadable"                      "row carries the unreadable reason"
+assert_contains "$out" "chmod a+r"                       "fix hint suggests chmod"
 
+# scanAllUserFeeds tags the row; scanUserFeeds (the loadable filter) hides it.
+# File is still 0 from above — keep it that way through the second node call.
+out=$(CLAUDE_CONFIG_DIR="$unreadable_dir" node -e "
+  const m = require('$CLI');
+  const dir = '$unreadable_dir/claude-newsline/feeds';
+  const all = m.scanAllUserFeeds(dir).map(f=>f.name+(f.compat.ok?'':':'+f.compat.reason)).join(',');
+  const loadable = m.scanUserFeeds(dir).map(f=>f.name).join(',');
+  console.log('all=' + all);
+  console.log('loadable=' + loadable);
+")
+assert_contains "$out" "secret:unreadable"   "scanAllUserFeeds tags secret as unreadable"
+assert_equals   "$(printf '%s\n' "$out" | grep '^loadable=' | cut -d= -f2)" \
+  "" "scanUserFeeds hides unreadable plugin from the loadable list"
+
+# Restore mode so rm -rf can clean up cleanly on EXIT trap.
+chmod 0644 "$unreadable_dir/claude-newsline/feeds/secret.sh"
+rm -rf "$unreadable_dir"
+
+}
+section "--list-feeds does not source plugin code (static parse)" && {
+# Regression: an earlier impl spawned `sh -c '. plugin'` per file with a
+# 2s timeout to verify feed_<name>() was defined. That executed arbitrary
+# plugin code at install / --list-feeds / wizard-render time. A misbehaving
+# plugin (sleep, infinite loop, side-effect at top level) could hang the
+# installer or run code the user never asked for. Static parse of the file
+# (regex for feed_<name>() definition) avoids the trust boundary entirely.
+ss_dir="$SANDBOX/cfg-static-scan"
+rm -rf "$ss_dir"
+mkdir -p "$ss_dir/claude-newsline/feeds"
+
+# A plugin whose top-level code WOULD fail / produce output if sourced.
+# Static parse must accept the feed_<name> definition as valid without
+# executing the offending lines above it.
+cat > "$ss_dir/claude-newsline/feeds/loud.sh" <<'SH'
+echo "PLUGIN SOURCED (should not see this)" >&2
+exit 1
+feed_loud() { LABEL='L'; URL='https://x'; JQ='.'; }
+SH
+
+# Run --list-feeds and capture both streams. The fingerprint string from
+# the plugin must NOT appear (would mean sourcing happened). The plugin
+# itself MUST appear in the user-feeds list (definition was detected).
+out=$(CLAUDE_CONFIG_DIR="$ss_dir" node "$CLI" --list-feeds 2>&1)
+case "$out" in
+  *"PLUGIN SOURCED"*) fail "--list-feeds did not source plugin code" "fingerprint string leaked" ;;
+  *)                  pass "--list-feeds did not source plugin code" ;;
+esac
+assert_contains "$out" "loud" "--list-feeds detected feed_loud() definition without sourcing"
+
+# A file with no feed_<name>() definition is correctly tagged incompatible
+# with a per-row fix hint (replaces the old "all incompat = api mismatch"
+# footer that was wrong for this case).
+cat > "$ss_dir/claude-newsline/feeds/empty.sh" <<'SH'
+# author wrote a comment but no function
+SH
+out=$(CLAUDE_CONFIG_DIR="$ss_dir" node "$CLI" --list-feeds 2>&1)
+assert_contains "$out" "empty"                                       "missing-function plugin listed under Incompatible"
+assert_contains "$out" "feed_empty() not defined in file"            "incompat row carries the specific reason"
+assert_contains "$out" "fix: add a \`feed_empty() { … }\` definition" "missing-function row carries fix hint"
+
+rm -rf "$ss_dir"
+
+}
+section "user feed override does not inherit built-in FEED_META" && {
+# Regression: when a user file overrides a built-in (e.g. hn.sh) and
+# doesn't set its own FEED_META_<name>, the built-in's metadata
+# (description, category, source=built-in) used to remain in the
+# environment. statusline.sh would then auto-attach `source=<user-path>`
+# on top of it, producing mixed-provenance metadata in NEWSLINE_DEBUG.
+# Fix: clear FEED_META_<name> before sourcing each user plugin.
+ov_dir="$SANDBOX/cfg-override"
+rm -rf "$ov_dir"
+mkdir -p "$ov_dir/claude-newsline/feeds"
+cat > "$ov_dir/claude-newsline/feeds/hn.sh" <<'SH'
+# Bare override — no FEED_META declared.
+feed_hn() { LABEL='HN-user'; URL='https://example.com/hn-user'; JQ='.[]|@tsv'; }
+SH
+
+dbg=$(CLAUDE_CONFIG_DIR="$ov_dir" NEWSLINE_DEBUG=1 NEWSLINE_FEEDS_DIR="$ov_dir/claude-newsline/feeds" \
+        bash "$STATUSLINE" </dev/null 2>&1)
+
+# Built-in description must NOT appear under feed `hn` since the user file
+# overrode the function but provided no metadata of its own.
+case "$dbg" in
+  *"Hacker News front page"*) fail "user override does not inherit built-in description" "built-in description leaked into override row" ;;
+  *)                          pass "user override does not inherit built-in description" ;;
+esac
+
+# The user-file source path SHOULD be auto-attached, since attribution is
+# the one piece of metadata the runtime owns.
+assert_contains "$dbg" "$ov_dir/claude-newsline/feeds/hn.sh" "user override carries auto-attached source path"
+
+rm -rf "$ov_dir"
+
+}
 section "--list-feeds -v groups plugins by FEED_META category" && {
 # With multiple categories present, -v renders a `[<Category>]` header
 # above each group. Plugins with no category land in "Custom" (user) or
@@ -2848,6 +3284,335 @@ fi
 
 # -----------------------------------------------------------------------------
 echo
+echo "=== regression fixes (v0.2.0 review pass) ==="
+
+section "is_disabled tolerates whitespace in NEWSLINE_FEEDS_DISABLED" && {
+# Repro for the silent miss: a user-friendly CSV like "reddit, lobsters"
+# (note the leading space on the second entry) used to disable only the
+# first entry — the substring match against ",reddit, lobsters," looked
+# for ",lobsters," literally and found ",␣lobsters," instead.
+prime_cache "HN" "Should Render" "https://example.com/x"
+out=$(NEWSLINE_FEEDS_DISABLED="reddit, lobsters" \
+      bash "$STATUSLINE" </dev/null 2>&1)
+assert_contains "$out" "Should Render" "headline still rendered (sanity)"
+
+# End-to-end: the only way to verify is_disabled is to drive a refresh and
+# inspect which feeds got fetched. Mock curl logs every URL it sees; we
+# assert that after disabling all three built-ins via spaced-CSV, no built-
+# in URL was fetched. If is_disabled mis-handled whitespace, lobsters or
+# reddit would slip through.
+fetch_log="$SANDBOX/fetch.log"
+: > "$fetch_log"
+make_mock_bin disable_curl spacecsv_curl curl <<MOCK
+#!/bin/sh
+url=""
+for arg in "\$@"; do case "\$arg" in https://*) url="\$arg" ;; esac; done
+printf '%s\n' "\$url" >> "$fetch_log"
+printf '{}'
+MOCK
+rm -f "$CACHE" "$CACHE.pending" "$CACHE.lock"
+NEWSLINE_FEEDS_DISABLED="hn, reddit, lobsters" \
+  PATH="$disable_curl:$PATH" \
+  bash "$STATUSLINE" </dev/null >/dev/null 2>&1
+# Wait briefly for any backgrounded fetch to land.
+sleep 0.5
+hits=$(wc -l <"$fetch_log" | tr -d ' ')
+assert_equals "$hits" "0" "spaced-CSV disables every named feed (no fetches)"
+rm -f "$fetch_log" "$CACHE" "$CACHE.pending" "$CACHE.lock"
+
+}
+section "--disable normalizes whitespace before writing .env" && {
+cat > "$SETTINGS" <<'JSON'
+{"model":"claude-opus-4-7"}
+JSON
+run_cli --disable "reddit, lobsters" >/dev/null 2>&1
+written=$(jq -r '.env.NEWSLINE_FEEDS_DISABLED' "$SETTINGS")
+assert_equals "$written" "reddit,lobsters" \
+  "--disable strips per-entry whitespace (canonical comma-tight form)"
+
+# Same for --only inversion (which routes through invertOnly() → join(',')).
+cat > "$SETTINGS" <<'JSON'
+{"model":"claude-opus-4-7"}
+JSON
+run_cli --only "hn" >/dev/null 2>&1
+written=$(jq -r '.env.NEWSLINE_FEEDS_DISABLED' "$SETTINGS")
+case "$written" in
+  *,*\ *|*\ *,*) fail "--only writes whitespace-tight CSV" "got: $written" ;;
+  *)             pass "--only writes whitespace-tight CSV" ;;
+esac
+
+}
+section "NEWSLINE_FEEDS_DIR override is honored by --new-feed and --list-feeds" && {
+override_dir="$SANDBOX/dotfile-feeds"
+rm -rf "$override_dir"
+NEWSLINE_FEEDS_DIR="$override_dir" node "$CLI" --new-feed dotfile_demo </dev/null >/dev/null 2>&1
+assert_file_exists "$override_dir/dotfile_demo.sh" \
+  "--new-feed scaffolds into NEWSLINE_FEEDS_DIR override"
+# The default location must NOT receive the file.
+assert_file_absent "$CLAUDE_CONFIG_DIR/claude-newsline/feeds/dotfile_demo.sh" \
+  "--new-feed does not stamp the default dir when override is set"
+
+# --list-feeds scans the override dir.
+out=$(NEWSLINE_FEEDS_DIR="$override_dir" node "$CLI" --list-feeds 2>&1)
+assert_contains "$out" "dotfile_demo" "--list-feeds shows plugins from NEWSLINE_FEEDS_DIR override"
+
+rm -rf "$override_dir"
+
+}
+section "parseFeedMeta accepts double-quoted FEED_META blocks" && {
+# Sh sources both quote styles; the static parser must too. A future-api
+# plugin written with double quotes used to bypass the installer-side gate
+# (treated as no-meta → implicit api=1 → "loadable") while the runtime
+# correctly skipped it. Symptom: file shows in --list-feeds, never rotates.
+dq_dir="$SANDBOX/cfg-double-quoted-meta"
+rm -rf "$dq_dir"
+mkdir -p "$dq_dir/claude-newsline/feeds"
+cat > "$dq_dir/claude-newsline/feeds/dq.sh" <<'SH'
+FEED_META_dq="description=Double-quoted metadata block
+api=99
+category=Future"
+feed_dq() { LABEL='DQ'; URL='https://x'; JQ='.'; }
+SH
+out=$(CLAUDE_CONFIG_DIR="$dq_dir" node "$CLI" --list-feeds 2>&1)
+assert_contains "$out" "Incompatible plugins" "double-quoted api=99 is detected as incompat"
+assert_contains "$out" "declares api=99"      "declared api surfaced from double-quoted body"
+# Also: double-quoted description is read out via parseFeedMeta in -v.
+out=$(CLAUDE_CONFIG_DIR="$dq_dir" node "$CLI" --list-feeds -v 2>&1)
+assert_contains "$out" "Double-quoted metadata block" "-v reads description from double quotes"
+
+# Direct unit-level check — parseFeedMeta returns the same object shape for
+# either quote style.
+out=$(node -e "
+  const m = require('$CLI');
+  const sq = m.parseFeedMeta(\"FEED_META_x='api=2\\nrole=test'\\n\", 'x');
+  const dq = m.parseFeedMeta('FEED_META_x=\"api=2\\nrole=test\"\\n', 'x');
+  console.log(JSON.stringify(sq) + '|' + JSON.stringify(dq));
+")
+assert_equals "$out" '{"api":"2","role":"test"}|{"api":"2","role":"test"}' \
+  "parseFeedMeta returns identical objects for single vs double quotes"
+
+rm -rf "$dq_dir"
+
+}
+section "detectFeedFunction tolerates next-line-brace style" && {
+# POSIX accepts feed_foo()<newline>{ … } — bash too. Pre-fix the static
+# parser required the brace on the same line as the parens, so a plugin
+# in the canonical-but-not-dominant style landed in Incompatible with a
+# misleading "feed_X() not defined" error pointing at code that IS defined.
+nlb_dir="$SANDBOX/cfg-next-line-brace"
+rm -rf "$nlb_dir"
+mkdir -p "$nlb_dir/claude-newsline/feeds"
+cat > "$nlb_dir/claude-newsline/feeds/nlb.sh" <<'SH'
+FEED_META_nlb='description=Next-line-brace style
+api=1'
+feed_nlb()
+{
+  LABEL='NLB'
+  URL='https://x'
+  JQ='.'
+}
+SH
+out=$(CLAUDE_CONFIG_DIR="$nlb_dir" node "$CLI" --list-feeds 2>&1)
+case "$out" in
+  *"Incompatible"*nlb*) fail "next-line-brace plugin must NOT land in Incompatible" ;;
+  *)                    pass "next-line-brace plugin is recognized as loadable" ;;
+esac
+assert_contains "$out" "nlb"             "next-line-brace plugin appears in user feeds"
+
+# Direct unit check on detectFeedFunction (via scanAllUserFeeds compat flag).
+out=$(node -e "
+  const m = require('$CLI');
+  const f = m.scanAllUserFeeds('$nlb_dir/claude-newsline/feeds').find(x => x.name === 'nlb');
+  console.log(f && f.compat && f.compat.ok ? 'loadable' : 'rejected');
+")
+assert_equals "$out" "loadable" "scanAllUserFeeds tags next-line-brace plugin loadable"
+
+rm -rf "$nlb_dir"
+
+}
+section "writeSettings errors loudly on a broken symlink" && {
+# Pre-fix: lstat saw the link, realpath threw ENOENT, the catch swallowed
+# it, and the subsequent renameSync replaced the link with a regular file —
+# silently destroying the dotfiles intent. Now: an explicit error.
+broken_dir="$SANDBOX/broken-link"
+mkdir -p "$broken_dir"
+ln -s "$broken_dir/does-not-exist.json" "$broken_dir/settings.json"
+out=$(CLAUDE_CONFIG_DIR="$broken_dir" node "$CLI" --yes </dev/null 2>&1)
+status=$?
+if [ "$status" -eq 0 ]; then
+  fail "broken-symlink install exits non-zero" "exited 0; symlink may have been replaced"
+else
+  pass "broken-symlink install exits non-zero"
+fi
+assert_contains "$out" "symlink to a missing target" "error message identifies the symlink failure"
+# Critical: the symlink must STILL be a symlink.
+if [ -L "$broken_dir/settings.json" ]; then
+  pass "broken symlink is preserved (not replaced with regular file)"
+else
+  fail "broken symlink is preserved (not replaced with regular file)" "link replaced"
+fi
+rm -rf "$broken_dir"
+
+}
+section "--color at runtime default elides the .env write" && {
+# Symmetric with the existing rotation/reddit elision rules. A user
+# explicitly picking dim_yellow (the runtime default) should clear any
+# stale prior override, not pin the value forever.
+sh_color=$(grep -E 'NEWSLINE_COLOR_FEED:-' "$SCRIPT_DIR/bin/statusline.sh" | head -1 | \
+  sed -E 's/.*:-([^}]+)\}.*/\1/')
+cat > "$SETTINGS" <<JSON
+{"env":{"NEWSLINE_COLOR_FEED":"sky"}}
+JSON
+run_cli --color "$sh_color" >/dev/null 2>&1
+assert_env_gone NEWSLINE_COLOR_FEED "explicit runtime-default color clears stale override"
+
+# A non-default color still writes through.
+cat > "$SETTINGS" <<'JSON'
+{"model":"claude-opus-4-7"}
+JSON
+run_cli --color sky >/dev/null 2>&1
+assert_equals "$(jq -r '.env.NEWSLINE_COLOR_FEED' "$SETTINGS")" "sky" \
+  "non-default color still written"
+
+}
+section "--separator at runtime default elides the .env write" && {
+sh_sep=$(grep -E 'NEWSLINE_LABEL_SEP:-' "$SCRIPT_DIR/bin/statusline.sh" | head -1 | \
+  sed -E 's/.*:-([^}]+)\}.*/\1/')
+cat > "$SETTINGS" <<'JSON'
+{"env":{"NEWSLINE_LABEL_SEP":" | "}}
+JSON
+# Pass the runtime default verbatim.
+run_cli --separator "$sh_sep" >/dev/null 2>&1
+assert_env_gone NEWSLINE_LABEL_SEP "explicit runtime-default separator clears stale override"
+
+# A non-default separator still writes through.
+cat > "$SETTINGS" <<'JSON'
+{"model":"claude-opus-4-7"}
+JSON
+run_cli --separator " | " >/dev/null 2>&1
+assert_equals "$(jq -r '.env.NEWSLINE_LABEL_SEP' "$SETTINGS")" " | " \
+  "non-default separator still written"
+
+}
+section "wizard option lists include the runtime default even when curated" && {
+# Drift guard: a future statusline.sh default change shouldn't make fresh-
+# install users unable to see the actual default in the wizard's picker.
+# wizardInitialValues is the fall-back; the option list construction is in
+# runWizard, which we can't drive non-interactively. So we assert the
+# JS-side helpers expose runtime defaults that match sh, and that
+# isAcceptedColor accepts the default — the building blocks the wizard uses.
+js_color=$(node -e "
+  // Re-derive the loadShDefault parse the way the installer does.
+  const fs = require('fs'), path = require('path');
+  const src = fs.readFileSync(path.join(path.dirname('$CLI'), 'statusline.sh'), 'utf8');
+  const m = src.match(/\"\\\$\\{NEWSLINE_COLOR_FEED(?::-|-)([^}]*)\\}\"/m);
+  console.log(m ? m[1] : 'unknown');
+")
+sh_color=$(grep -E 'NEWSLINE_COLOR_FEED:-' "$SCRIPT_DIR/bin/statusline.sh" | head -1 | \
+  sed -E 's/.*:-([^}]+)\}.*/\1/')
+assert_equals "$js_color" "$sh_color" "JS reads NEWSLINE_COLOR_FEED default same as sh"
+
+}
+section "stale .new.* tape files are reaped on cache-stale ticks" && {
+# refresh_all_feeds writes the merged tape to $CACHE_FILE.new.$$ before
+# mv'ing it to .pending or the live cache. A SIGKILL between awk completion
+# and the mv leaves $CACHE_FILE.new.<pid> on disk forever — disk waste,
+# AND uninstall's `rmdir cache/` then fails with ENOTEMPTY, leaving the
+# cache directory behind after `--uninstall`.
+#
+# Plant a clearly-orphaned .new.* file with a far-past mtime, drive a tick
+# that triggers the refresh branch (cache stale or absent), and assert the
+# reaper picked it up. The reaper mirrors the existing buckets reaper —
+# same STALE_REAP_SEC budget, same gating on entering the refresh branch.
+ensure_fakedate
+mkdir -p "$(dirname "$CACHE")"
+rm -f "$CACHE" "$CACHE.pending" "$CACHE.new."*
+rm -rf "$CACHE.lock" "$CACHE.buckets."*
+# Plant the orphan with epoch-0 mtime so any positive FAKE_NOW is well past
+# STALE_REAP_SEC=60. perl utime is the portable way to reach mtime=0.
+touch "$CACHE.new.99999"
+perl -e 'utime 0, 0, $ARGV[0]' "$CACHE.new.99999"
+
+# Cache is empty → tick enters refresh branch and runs reapers. We don't
+# need the refresh itself to succeed; the reaper runs unconditionally
+# inside the branch. Mock curl as a no-op so the foreground returns fast.
+make_mock_bin newreap_curl newreap_curl curl <<'SH'
+#!/bin/sh
+exit 1
+SH
+FAKE_NOW=600 NEWSLINE_FEEDS_DISABLED="hn,reddit,lobsters" \
+  PATH="$fakedate_dir:$newreap_curl:$PATH" bash "$STATUSLINE" </dev/null >/dev/null 2>&1 || true
+
+if [ ! -e "$CACHE.new.99999" ]; then
+  pass "stale .new.<pid> orphan reaped on cache-stale tick"
+else
+  fail "stale .new.<pid> orphan reaped on cache-stale tick" "$CACHE.new.99999 still present"
+fi
+
+# Sibling guard: a freshly-written .new.* file must NOT be reaped (would
+# clobber an in-flight refresh on a slow-disk box where the awk finished
+# but the mv hasn't fired yet). STALE_REAP_SEC=60, FAKE_NOW=10 → fresh.
+rm -f "$CACHE.new."*
+touch "$CACHE.new.88888"   # mtime = now (real wall clock, but ≪ FAKE_NOW)
+FAKE_NOW=10 NEWSLINE_FEEDS_DISABLED="hn,reddit,lobsters" \
+  PATH="$fakedate_dir:$newreap_curl:$PATH" bash "$STATUSLINE" </dev/null >/dev/null 2>&1 || true
+if [ -e "$CACHE.new.88888" ]; then
+  pass "fresh .new.<pid> file is NOT reaped (in-flight refresh safe)"
+else
+  fail "fresh .new.<pid> file is NOT reaped (in-flight refresh safe)" \
+    "reaper aged out a fresh staging file"
+fi
+rm -f "$CACHE.new."*
+
+}
+section "_pipe_strip_c1 drops bare C1 control bytes from feed bodies" && {
+# Defense-in-depth check: an attacker-controlled feed could in theory smuggle
+# bare 0x9B (C1 CSI) bytes that aren't valid UTF-8 continuations. The
+# tr -d C0 strip doesn't touch 0x80-0x9F, so iconv -f UTF-8 -t UTF-8 -c
+# was wired in to drop bare C1 bytes while preserving valid multi-byte UTF-8.
+#
+# Skip this test on hosts without iconv — the script's _HAVE_ICONV gate
+# already degrades to cat in that case, and asserting iconv-specific
+# behavior would just mark the host as failing.
+if ! iconv -f UTF-8 -t UTF-8 -c </dev/null >/dev/null 2>&1; then
+  pass "iconv unavailable on host — skipping C1 strip assertion"
+else
+  c1_dir="$SANDBOX/c1-strip"
+  mkdir -p "$c1_dir"
+  cat > "$c1_dir/c1feed.sh" <<'SH'
+feed_c1feed() {
+  LABEL='C1'
+  URL='https://example.test/c1.json'
+  JQ='.items[] | [$default, .title, .url] | @tsv'
+}
+SH
+  # Mock curl returns a JSON title containing a bare 0x9B byte. After C0
+  # strip 0x9B survives; iconv drops it because it isn't part of a valid
+  # UTF-8 sequence. The cleaned title should not contain the byte.
+  make_mock_bin c1_curl c1_fetch curl <<'MOCK'
+#!/bin/sh
+printf '{"items":[{"title":"safe\x9bHIJACK","url":"https://example.test/c1"}]}\n'
+MOCK
+  rm -f "$CACHE" "$CACHE.pending" "$CACHE.lock"
+  NEWSLINE_FEEDS_DIR="$c1_dir" NEWSLINE_FEEDS_DISABLED="hn,reddit,lobsters" \
+    PATH="$c1_curl:$PATH" bash "$STATUSLINE" </dev/null >/dev/null 2>&1
+  wait_for_cache
+  if grep -q $'\x9b' "$CACHE" 2>/dev/null; then
+    fail "bare C1 byte (0x9B) stripped from cache" "byte survived through pipeline"
+  else
+    pass "bare C1 byte (0x9B) stripped from cache"
+  fi
+  # Surrounding bytes ('safe' + 'HIJACK') survive — the strip targets only
+  # the malformed byte, not the legitimate text around it.
+  assert_contains "$(cat "$CACHE")" "safe" "legitimate text before C1 byte preserved"
+  assert_contains "$(cat "$CACHE")" "HIJACK" "legitimate text after C1 byte preserved"
+  rm -rf "$c1_dir"
+fi
+
+}
+
+# -----------------------------------------------------------------------------
+echo
 section "unit helpers" && {
 
 # stripSuffix / invertOnly are exported for direct unit-testing — avoids
@@ -2947,6 +3712,28 @@ out=$(node -e "
 ")
 assert_equals "$out" "my-cmd" "stripSuffix handles path with a space via shellQuote"
 
+# Paths with literal apostrophes survive shellQuote (POSIX '\'' escape) and
+# must round-trip through stripSuffix. Pre-fix, QUOTED_PATH disallowed any
+# `'` inside the path, so a user with `~/jane's home/.claude/...` would see
+# their suffix unrecognised — re-installs would double-append, uninstall
+# would leave the suffix in place.
+out=$(node -e "
+  const m = require('$CLI');
+  const p = \"/Users/jane's home/.claude/claude-newsline.sh\";
+  const cmd = \"keep-me ; bash \" + m.shellQuote(p);
+  console.log(m.stripSuffix(cmd));
+")
+assert_equals "$out" "keep-me" "stripSuffix handles path with apostrophe via shellQuote"
+
+# Standalone (no preceding command) with apostrophe path — same regex, just
+# without the leading chain.
+out=$(node -e "
+  const m = require('$CLI');
+  const p = \"/Users/jane's home/.claude/claude-newsline.sh\";
+  console.log('[' + m.stripSuffix(\"bash \" + m.shellQuote(p)) + ']');
+")
+assert_equals "$out" "[]" "stripSuffix blanks standalone apostrophe-path command"
+
 # Marker-prefixed form (what current installer writes). Must strip in all
 # three positions: end-of-chain, standalone, mid-chain, start-of-chain.
 out=$(node -e "
@@ -2999,6 +3786,36 @@ out=$(node -e "
   console.log(m.shellQuote(\"it's a path\"));
 ")
 assert_equals "$out" "'it'\\''s a path'" "shellQuote escapes embedded quote"
+
+# escapeRegex must escape every regex meta-char it claims to handle. The
+# earlier inline form ([.*+?^${}()|[\\]\\\\]) had a misplaced ] that closed
+# the class early, making escape a no-op for normal bases — `settings.json`
+# was embedded with an unescaped `.`, so a look-alike file like
+# `settingsXjson.bak.123` would be mis-identified as our backup and pruned.
+out=$(node -e "
+  const m = require('$CLI');
+  console.log(m.escapeRegex('a.b*c+d?e^f\$g{h}i(j)k|l[m]n\\\\o'));
+")
+assert_equals "$out" 'a\.b\*c\+d\?e\^f\$g\{h\}i\(j\)k\|l\[m\]n\\o' "escapeRegex escapes the full meta-char set"
+
+# Round-trip: listBackups must NOT match a similarly-named non-backup file.
+# Set up a sandbox dir, drop our real backup AND a look-alike, and confirm
+# only the real one comes back.
+backup_dir=$(mktemp -d -t feedstatus-bak-XXXXXX)
+touch "$backup_dir/settings.json"
+touch "$backup_dir/settings.json.bak.100"        # real
+touch "$backup_dir/settings.json.bak.200"        # real
+touch "$backup_dir/settingsXjson.bak.300"        # look-alike with X in `.` slot
+touch "$backup_dir/SETTINGS.JSON.bak.400"        # case-different, must not match
+touch "$backup_dir/settings.json.bak.notnum"     # non-numeric ts, must not match
+out=$(node -e "
+  const m = require('$CLI');
+  const baks = m.listBackups('$backup_dir/settings.json');
+  console.log(baks.join(','));
+")
+assert_equals "$out" "settings.json.bak.100,settings.json.bak.200" \
+  "listBackups returns only real backups, not look-alike filenames"
+rm -rf "$backup_dir"
 
 # reconcileEnv with clearStale=true purges owned keys not in the updates
 # (wizard re-run where the user turned a setting off). Flag-driven path
@@ -3215,6 +4032,34 @@ assert_contains "$out" '"feeds":["hn","reddit","lobsters"]' "wizard defaults all
 assert_contains "$out" '"color":"amber"'                    "wizard defaults color=amber"
 assert_contains "$out" '"showLabels":true'                  "wizard defaults showLabels=true"
 assert_contains "$out" '"motion":"slide"'                   "wizard defaults motion=slide when env empty"
+
+# Hand-edited NEWSLINE_COLOR_FEED that's a raw SGR sequence — must survive a
+# wizard reconfigure. Pre-fix this returned 'amber' because the helper only
+# checked NAMED_COLORS; raw SGR slipped through validation but failed the
+# pre-fill, so a user with NEWSLINE_COLOR_FEED='38;5;208' lost their setting.
+out=$(node -e "
+  const m = require('$CLI');
+  const r = m.wizardInitialValues(
+    { NEWSLINE_COLOR_FEED: '38;5;208' },
+    [10, 20], [' \u2022 '],
+  );
+  console.log(r.color);
+")
+assert_equals "$out" "38;5;208" "wizard preserves a raw-SGR NEWSLINE_COLOR_FEED hand-edit"
+
+# Same class of bug for NEWSLINE_LABEL_SEP. The helper trusts the caller's
+# separatorOptions list — runWizard injects the env value when it isn't in
+# the curated four — so when the caller does inject, the helper round-trips.
+# Regression: pass the env separator in the options and assert it survives.
+out=$(node -e "
+  const m = require('$CLI');
+  const env = { NEWSLINE_LABEL_SEP: ' :: ' };
+  // Mirror what runWizard does today: append envSep when not in defaults.
+  const opts = [' \u2022 ', ' \u203a ', ' :: '];
+  const r = m.wizardInitialValues(env, [20], opts);
+  console.log(r.separator);
+")
+assert_equals "$out" " :: " "wizard preserves an injected hand-edited separator"
 
 # Motion inference from existing env — NEWSLINE_SCROLL=0 → static regardless
 # of NEWSLINE_SCROLL_SEC; NEWSLINE_SCROLL_SEC<default → quick; otherwise → slide.

@@ -21,48 +21,122 @@ process.stdin.on('data', chunk => { xml += chunk; });
 // other stdin errors shouldn't be silently hidden.
 process.stdin.on('error', e => { if (e.code !== 'EPIPE') throw e; });
 process.stdin.on('end', () => {
-  const unwrapCdata = s => s.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1');
+  // CDATA handling — placeholder substitution.
+  //
+  // Earlier impl did `unwrapCdata` once, top-level, before ITEM_RE / TITLE_RE
+  // ran on the result. Two correctness defects fell out:
+  //
+  //   1. CDATA may legitimately contain `</item>` text. The regex parser
+  //      can't see CDATA boundaries, so the non-greedy ITEM_RE stopped at
+  //      the FIRST literal `</item>` — even one inside CDATA — and
+  //      truncated parsing for the rest of the document. A single CDATA
+  //      block could silently empty an entire feed.
+  //
+  //   2. Per XML spec, CDATA disables entity processing. The unwrap-then-
+  //      decode order meant a literal `&amp;` inside CDATA decoded to `&`,
+  //      which is wrong (the feed author wrote literal text and meant it).
+  //
+  // Both fall away if CDATA blocks never appear as XML markup to the regex
+  // pipeline. Replace each `<![CDATA[...]]>` with a unique placeholder
+  // before any regex runs; restore at field-emit time, marked verbatim so
+  // entity decode skips that segment. Placeholders use Private-Use
+  // Unicode (U+E000..) — ITEM_RE / TITLE_RE / LINK_RE can't match against
+  // them, and clean()'s C0/C1 strip leaves PUA alone.
+  const CDATA_OPEN = '\uE000';
+  const CDATA_CLOSE = '\uE001';
+  const cdataSlots = [];
+  const xmlSafe = xml.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, (_, body) => {
+    const i = cdataSlots.length;
+    cdataSlots.push(body);
+    return `${CDATA_OPEN}${i}${CDATA_CLOSE}`;
+  });
+  const PLACEHOLDER_RE = new RegExp(`${CDATA_OPEN}(\\d+)${CDATA_CLOSE}`, 'g');
 
   // Single-pass combined regex is what makes double-escape handling
-  // correct: `&amp;lt;` must decode once to the literal 4-char `&lt;`, not
-  // all the way to `<`. .replace(/g) scans left-to-right and does NOT
-  // re-scan replaced content, so `&amp;` matches first, becomes `&`, the
-  // cursor advances past the replacement, and `lt;` never matches. One
-  // combined sweep does everything; splitting this into per-entity
-  // `.replace()` calls would re-scan after `&amp;` → `&` and over-decode.
-  // Alternation order inside the regex is irrelevant because the named
-  // entities don't share prefixes.
+  // correct: every `&...;` token must decode exactly once. .replace(/g)
+  // scans left-to-right and does NOT re-scan replaced content — the
+  // cursor advances past the matched region in the original string, so
+  // a token produced by an earlier replacement (`&` from `&amp;`,
+  // `&` from `&#38;`) cannot fuse with the trailing literal characters
+  // into a second match.
+  //
+  // Splitting this into per-encoding `.replace()` calls (one for `&#NN;`,
+  // one for `&#xHH;`, one for named) WOULD re-scan after each pass and
+  // over-decode: `&amp;lt;` (correct: `&lt;`) survives because both halves
+  // are named, but `&#38;lt;` would go numeric→`&lt;`→named→`<`. One
+  // combined alternation matches numeric, hex, and named in the same pass.
+  // Alternation order is irrelevant — the leading `&` and trailing `;` are
+  // anchors and the inner alternations don't share prefixes.
   const NAMED = { lt: '<', gt: '>', quot: '"', apos: "'", amp: '&' };
   const decodeNumeric = v => v > 0x10FFFF ? '' : String.fromCodePoint(v);
-  const decode = s => s
-    .replace(/&#(\d+);/g,           (_, n) => decodeNumeric(parseInt(n, 10)))
-    .replace(/&#x([0-9a-fA-F]+);/g, (_, n) => decodeNumeric(parseInt(n, 16)))
-    .replace(/&(lt|gt|quot|apos|amp);/g, (_, e) => NAMED[e]);
+  const ENTITY_RE = /&(?:#(\d+)|#x([0-9a-fA-F]+)|(lt|gt|quot|apos|amp));/g;
+  const decode = s => s.replace(ENTITY_RE, (_, dec, hex, name) => {
+    if (dec !== undefined) return decodeNumeric(parseInt(dec, 10));
+    if (hex !== undefined) return decodeNumeric(parseInt(hex, 16));
+    return NAMED[name];
+  });
 
-  // C0-strip after decode so `&#10;` (newline entity) gets squashed to
+  // Restore CDATA placeholders to verbatim text. Entities inside CDATA
+  // are NOT decoded — that's the spec. Walking matchAll lets us treat
+  // verbatim segments as separate concatenation, so an `&amp;` inside
+  // CDATA survives a subsequent decode() pass on the surrounding text.
+  const expandWithVerbatim = (s) => {
+    if (!cdataSlots.length) return decode(s);
+    let out = '';
+    let last = 0;
+    for (const m of s.matchAll(PLACEHOLDER_RE)) {
+      out += decode(s.slice(last, m.index));
+      out += cdataSlots[Number(m[1])] || '';
+      last = m.index + m[0].length;
+    }
+    out += decode(s.slice(last));
+    return out;
+  };
+
+  // C0-strip after expand so `&#10;` (newline entity) gets squashed to
   // space here — jq @tsv downstream would otherwise split a title with
   // a literal \n across two cache records.
-  const clean = s => decode(unwrapCdata(s))
+  const clean = s => expandWithVerbatim(s)
     .replace(/[\x00-\x1f\x7f]+/g, ' ')
     .replace(/\s+/g, ' ')
+    .trim();
+  // URLs go through a stricter cleaner: line-wrapped CDATA in <link> elements
+  // (common in pretty-printed feeds) would otherwise leave a literal space
+  // in the URL, which the OSC 8 hyperlink wrapper then ships to the terminal
+  // verbatim — most terminals split on the space and the link silently
+  // breaks. Strip whitespace + controls outright instead of collapsing.
+  const cleanUrl = s => expandWithVerbatim(s)
+    .replace(/[\x00-\x20\x7f]+/g, '')
     .trim();
 
   const ITEM_RE = /<(item|entry)\b[^>]*>([\s\S]*?)<\/\1\s*>/gi;
   const TITLE_RE = /<title\b[^>]*>([\s\S]*?)<\/title\s*>/i;
   const LINK_CONTENT_RE = /<link\b[^>]*>([\s\S]+?)<\/link\s*>/i;
   const LINK_TAG_RE = /<link\b[^>]*>/gi;
-  const attr = (tag, name) => {
-    const re = new RegExp(`\\b${name}\\s*=\\s*(["'])([^"']*)\\1`, 'i');
+  // Pre-compiled per-attribute regexes. bestHref is the only caller and it
+  // only ever asks for these two; constructing `new RegExp` per lookup (the
+  // prior shape) compiled the same pattern once per <link> tag in the feed
+  // — wasteful, and pretended to be more general than the code is.
+  const HREF_RE = /\bhref\s*=\s*(["'])([^"']*)\1/i;
+  const REL_RE  = /\brel\s*=\s*(["'])([^"']*)\1/i;
+  // Two cleaners: href values use cleanUrl (no whitespace tolerance); rel
+  // is a token attribute compared as text. matchAttrUrl applies cleanUrl;
+  // matchAttr keeps the prose-friendly clean.
+  const matchAttr = (tag, re) => {
     const m = tag.match(re);
     return m ? clean(m[2]) : '';
+  };
+  const matchAttrUrl = (tag, re) => {
+    const m = tag.match(re);
+    return m ? cleanUrl(m[2]) : '';
   };
   const bestHref = body => {
     let fallback = '';
     for (const m of body.matchAll(LINK_TAG_RE)) {
       const tag = m[0];
-      const href = attr(tag, 'href');
+      const href = matchAttrUrl(tag, HREF_RE);
       if (!href) continue;
-      const rel = attr(tag, 'rel').toLowerCase();
+      const rel = matchAttr(tag, REL_RE).toLowerCase();
       if (rel === 'alternate' || rel === '') return href;
       if (!fallback) fallback = href;
     }
@@ -73,7 +147,11 @@ process.stdin.on('end', () => {
   const DESC_RE = /<(?:description|summary)\b[^>]*>([\s\S]*?)<\/(?:description|summary)\s*>/i;
 
   const items = [];
-  for (const m of xml.matchAll(ITEM_RE)) {
+  // Walk the placeholder-substituted source so CDATA-internal markup (like a
+  // literal `</item>`) can't truncate item bodies. Field-level extraction
+  // below also runs against the substituted body; clean()/cleanUrl() restore
+  // the verbatim CDATA text at the last possible step.
+  for (const m of xmlSafe.matchAll(ITEM_RE)) {
     const body = m[2];
     const tMatch = body.match(TITLE_RE);
     const title = tMatch ? clean(tMatch[1]) : '';
@@ -82,7 +160,7 @@ process.stdin.on('end', () => {
     // rel="self", which usually points at the feed/API entry, not the story.
     let link = '';
     const lc = body.match(LINK_CONTENT_RE);
-    if (lc) link = clean(lc[1]);
+    if (lc) link = cleanUrl(lc[1]);
     if (!link) {
       link = bestHref(body);
     }
