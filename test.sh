@@ -762,6 +762,18 @@ section "NEWSLINE_CACHE_CHUNK guards against awk infinite loop on bad values" &&
 # `pos += chunk` with chunk coerced to 0 (empty / non-numeric / "0") would
 # never advance — awk pegs CPU and holds the lock until reaper. guard_num
 # coerces those back to 1, so the cache builds normally and the call returns.
+#
+# `timeout` (GNU coreutils) ships preinstalled on Linux but NOT on stock
+# macOS — Homebrew users get it as `gtimeout`, or as `timeout` after
+# `brew install coreutils` puts coreutils' bin first on PATH. Detect whichever
+# is available; skip the timing assertion (with a clear message) when neither
+# exists, since we can't bound the run portably without the helper.
+chunk_timeout=""
+if command -v timeout >/dev/null 2>&1; then
+  chunk_timeout=timeout
+elif command -v gtimeout >/dev/null 2>&1; then
+  chunk_timeout=gtimeout
+fi
 mkdir -p "$CLAUDE_CONFIG_DIR/cache"
 make_mock_bin chunk_curl chunkcurl curl <<'SH'
 #!/bin/sh
@@ -772,23 +784,30 @@ case "$url" in
   *)            printf '{}\n' ;;
 esac
 SH
-for bad in 0 abc -1 ''; do
-  rm -f "$CACHE" "$CACHE.pending" "$CACHE.lock"
-  if NEWSLINE_FEEDS_DISABLED="reddit,lobsters" \
-     NEWSLINE_CACHE_CHUNK="$bad" \
-     PATH="$chunk_curl:$PATH" \
-     timeout 5 bash "$STATUSLINE" </dev/null >/dev/null 2>&1; then
-    pass "NEWSLINE_CACHE_CHUNK=${bad:-(empty)} returns within timeout"
-  else
-    fail "NEWSLINE_CACHE_CHUNK=${bad:-(empty)} returns within timeout" "awk-loop hang or non-zero exit"
-  fi
-  wait_for_cache
-  if [ -s "$CACHE" ]; then
-    pass "NEWSLINE_CACHE_CHUNK=${bad:-(empty)} still produced cache content"
-  else
-    fail "NEWSLINE_CACHE_CHUNK=${bad:-(empty)} still produced cache content" "cache empty"
-  fi
-done
+if [ -z "$chunk_timeout" ]; then
+  # Honest skip — without a timeout helper we can't actually catch a hang,
+  # so asserting "doesn't hang" would be lying. The Ubuntu CI matrix row
+  # still exercises this code path on every push.
+  pass "NEWSLINE_CACHE_CHUNK guard — skipped (no timeout/gtimeout on PATH; run brew install coreutils on macOS)"
+else
+  for bad in 0 abc -1 ''; do
+    rm -f "$CACHE" "$CACHE.pending" "$CACHE.lock"
+    if NEWSLINE_FEEDS_DISABLED="reddit,lobsters" \
+       NEWSLINE_CACHE_CHUNK="$bad" \
+       PATH="$chunk_curl:$PATH" \
+       "$chunk_timeout" 5 bash "$STATUSLINE" </dev/null >/dev/null 2>&1; then
+      pass "NEWSLINE_CACHE_CHUNK=${bad:-(empty)} returns within timeout"
+    else
+      fail "NEWSLINE_CACHE_CHUNK=${bad:-(empty)} returns within timeout" "awk-loop hang or non-zero exit"
+    fi
+    wait_for_cache
+    if [ -s "$CACHE" ]; then
+      pass "NEWSLINE_CACHE_CHUNK=${bad:-(empty)} still produced cache content"
+    else
+      fail "NEWSLINE_CACHE_CHUNK=${bad:-(empty)} still produced cache content" "cache empty"
+    fi
+  done
+fi
 rm -f "$CACHE" "$CACHE.pending" "$CACHE.lock"
 
 }
