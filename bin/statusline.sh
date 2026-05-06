@@ -50,6 +50,7 @@ FEED_API_VERSION=2
 # Default jq filter for FEED_PARSER=xml plugins with no JQ declared —
 # keeps the "just give me title + link" case down to three lines of
 # plugin. Leading underscore so a plugin can't accidentally shadow it.
+# shellcheck disable=SC2016  # $default is a jq variable bound via --arg, not a shell expansion.
 _FEED_XML_DEFAULT_JQ='.[] | [$default, .title, .link] | @tsv'
 
 # shellcheck disable=SC2034  # Read via eval in describe_feed_meta().
@@ -437,6 +438,7 @@ load_user_feeds() {
     eval "_meta=\${FEED_META_$_uname:-}"
     # Pull `api=<N>` out of the metadata block. First match wins; newline-
     # oriented so it doesn't trip over `api` appearing in a description.
+    # shellcheck disable=SC2154  # _meta assigned by the preceding `eval`.
     _plugin_api=$(printf '%s' "$_meta" | awk -F= '$1=="api" { print $2; exit }')
     case "$_plugin_api" in
       ''|*[!0-9]*) : ;; # absent / non-numeric → implicit v1
@@ -976,6 +978,7 @@ if [ -n "${NEWSLINE_TEST_FEED:-}" ]; then
   esac
   if ! command -v "feed_$_tfeed" >/dev/null 2>&1; then
     printf 'claude-newsline: unknown feed: %s\n' "$_tfeed" >&2
+    # shellcheck disable=SC2086  # Word-splitting intentional — $ALL_FEEDS is a space-separated list.
     printf 'available:%s\n' "$(printf ' %s' $ALL_FEEDS)" >&2
     exit 2
   fi
@@ -996,6 +999,7 @@ if [ -n "${NEWSLINE_TEST_FEED:-}" ]; then
   _test_one_invocation() {
     _to_header=${1:-}
     if [ -n "$_to_header" ]; then
+      # shellcheck disable=SC2154  # _tc_dim assigned by set_ansi above.
       printf '\n%s%s%s\n' "$_tc_dim" "$_to_header" "$RESET"
     fi
     printf '  URL:      %s\n' "$URL"
@@ -1087,6 +1091,7 @@ if [ -n "${NEWSLINE_TEST_FEED:-}" ]; then
       $3 !~ /^https?:\/\// { print $3; exit }
     ')
     if [ -n "$_to_bad" ]; then
+      # shellcheck disable=SC2154  # _tc_warn assigned by set_ansi above.
       printf '  %s⚠ URL scheme not http(s):%s %s\n' "$_tc_warn" "$RESET" "$_to_bad"
       printf '            OSC 8 hyperlink will be dropped; headline still renders.\n'
     fi
@@ -1105,6 +1110,7 @@ if [ -n "${NEWSLINE_TEST_FEED:-}" ]; then
   eval "_t_params_var=\${FEED_PARAMS_$_tfeed:-}"
   if [ -n "$_t_params_var" ]; then
     eval "_t_params_val=\${$_t_params_var:-}"
+    # shellcheck disable=SC2154  # _t_params_val assigned by the preceding `eval`.
     printf ' %s(parameterized via %s="%s")%s\n' "$_tc_dim" "$_t_params_var" "$_t_params_val" "$RESET"
     _t_ok=0; _t_fail=0
     _old_ifs=$IFS
@@ -1125,6 +1131,7 @@ if [ -n "${NEWSLINE_TEST_FEED:-}" ]; then
       printf '\n'
       printf '    1. Set NEWSLINE_%s in your env or settings.json, AND make sure\n' "$_t_params_var"
       printf '       your plugin file contains this binding line:\n'
+      # shellcheck disable=SC2016  # printf format string — `${NEWSLINE_%s:-}` is template text shown to the user, not a shell expansion.
       printf '         %s="${NEWSLINE_%s:-}"\n' "$_t_params_var" "$_t_params_var"
       printf '       (without it, NEWSLINE_%s is read by nothing.)\n' "$_t_params_var"
       printf '\n'
@@ -1132,6 +1139,7 @@ if [ -n "${NEWSLINE_TEST_FEED:-}" ]; then
       printf '         NEWSLINE_%s=value1,value2 claude-newsline --test-feed %s\n' "$_t_params_var" "$_tfeed"
       printf '\n'
       printf '    3. Give FEED_PARAMS_%s a sensible default in your plugin:\n' "$_tfeed"
+      # shellcheck disable=SC2016  # printf format string — `${NEWSLINE_%s:-default-entry}` is template text shown to the user.
       printf '         %s="${NEWSLINE_%s:-default-entry}"\n' "$_t_params_var" "$_t_params_var"
       exit 1
     fi

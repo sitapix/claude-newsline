@@ -4,7 +4,25 @@ All notable changes to claude-newsline. Format follows [Keep a Changelog](https:
 the project follows [SemVer](https://semver.org/) — under 1.0.0, behaviour changes still ship as patch
 releases when they're bug fixes against the documented or specified intent.
 
-## [0.2.1] — 2026-05-05
+## [0.2.2] — 2026-05-05
+
+### Fixed
+
+- **CI green again.** v0.2.1's publish job failed on Ubuntu CI for two reasons that didn't
+  surface on the maintainer's macOS:
+    - shellcheck flagged eight false positives — `eval`-assigned variables (`_meta`,
+      `_tc_dim`, `_tc_warn`, `_t_params_val`) and intentional patterns (jq `$default`
+      inside single quotes, intentional `$ALL_FEEDS` word splitting, printf format
+      strings showing `${NEWSLINE_*}` template text to users). All sites now carry
+      narrowly-scoped `# shellcheck disable=…` comments with the rationale.
+    - The C1-strip test fed a bare `0x9B` byte through `curl | jq` end-to-end. Ubuntu's
+      jq correctly rejects bare `0x9B` as invalid UTF-8, starving the assertion of
+      any input. The test now exercises iconv directly (the actual capability under
+      review) and only attempts the e2e leg when the host's jq accepts the input.
+
+No runtime behaviour change vs v0.2.1; this is the publishable form of the same fix set.
+
+## [0.2.1] — 2026-05-05 (unpublished — see 0.2.2)
 
 ### Security
 

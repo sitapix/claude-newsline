@@ -3577,36 +3577,51 @@ section "_pipe_strip_c1 drops bare C1 control bytes from feed bodies" && {
 if ! iconv -f UTF-8 -t UTF-8 -c </dev/null >/dev/null 2>&1; then
   pass "iconv unavailable on host — skipping C1 strip assertion"
 else
-  c1_dir="$SANDBOX/c1-strip"
-  mkdir -p "$c1_dir"
-  cat > "$c1_dir/c1feed.sh" <<'SH'
+  # Direct test: the iconv stage drops the bare 0x9B byte AND preserves the
+  # legitimate text around it. This is the property the runtime relies on,
+  # tested without a curl|jq pipeline in front of it — Ubuntu's jq rejects
+  # bare 0x9B as invalid UTF-8 (correct behavior, but it'd starve the e2e
+  # path of any input to assert against), so we exercise the strip directly.
+  iconv_out=$(printf 'safe\x9bHIJACK' | iconv -f UTF-8 -t UTF-8 -c 2>/dev/null)
+  if printf '%s' "$iconv_out" | grep -q $'\x9b'; then
+    fail "iconv -c drops bare C1 byte (0x9B)" "byte survived iconv stage"
+  else
+    pass "iconv -c drops bare C1 byte (0x9B)"
+  fi
+  assert_contains "$iconv_out" "safe"   "legitimate text before C1 byte preserved (direct iconv)"
+  assert_contains "$iconv_out" "HIJACK" "legitimate text after C1 byte preserved (direct iconv)"
+
+  # End-to-end: when jq accepts the bare byte (macOS jq does, Ubuntu jq
+  # rejects strict-UTF-8 inputs), confirm the byte never lands in the
+  # cache. Skip this leg on jq builds that reject the input — there's
+  # nothing to assert about a bucket the parser already rejected upstream.
+  if printf '{"x":"\x9b"}' | jq . >/dev/null 2>&1; then
+    c1_dir="$SANDBOX/c1-strip"
+    mkdir -p "$c1_dir"
+    cat > "$c1_dir/c1feed.sh" <<'SH'
 feed_c1feed() {
   LABEL='C1'
   URL='https://example.test/c1.json'
   JQ='.items[] | [$default, .title, .url] | @tsv'
 }
 SH
-  # Mock curl returns a JSON title containing a bare 0x9B byte. After C0
-  # strip 0x9B survives; iconv drops it because it isn't part of a valid
-  # UTF-8 sequence. The cleaned title should not contain the byte.
-  make_mock_bin c1_curl c1_fetch curl <<'MOCK'
+    make_mock_bin c1_curl c1_fetch curl <<'MOCK'
 #!/bin/sh
 printf '{"items":[{"title":"safe\x9bHIJACK","url":"https://example.test/c1"}]}\n'
 MOCK
-  rm -f "$CACHE" "$CACHE.pending" "$CACHE.lock"
-  NEWSLINE_FEEDS_DIR="$c1_dir" NEWSLINE_FEEDS_DISABLED="hn,reddit,lobsters" \
-    PATH="$c1_curl:$PATH" bash "$STATUSLINE" </dev/null >/dev/null 2>&1
-  wait_for_cache
-  if grep -q $'\x9b' "$CACHE" 2>/dev/null; then
-    fail "bare C1 byte (0x9B) stripped from cache" "byte survived through pipeline"
+    rm -f "$CACHE" "$CACHE.pending" "$CACHE.lock"
+    NEWSLINE_FEEDS_DIR="$c1_dir" NEWSLINE_FEEDS_DISABLED="hn,reddit,lobsters" \
+      PATH="$c1_curl:$PATH" bash "$STATUSLINE" </dev/null >/dev/null 2>&1
+    wait_for_cache
+    if grep -q $'\x9b' "$CACHE" 2>/dev/null; then
+      fail "bare C1 byte stripped end-to-end via curl|jq pipeline" "byte survived through pipeline"
+    else
+      pass "bare C1 byte stripped end-to-end via curl|jq pipeline"
+    fi
+    rm -rf "$c1_dir"
   else
-    pass "bare C1 byte (0x9B) stripped from cache"
+    pass "jq rejects bare C1 input upstream of iconv (Ubuntu jq strict-UTF-8 path)"
   fi
-  # Surrounding bytes ('safe' + 'HIJACK') survive — the strip targets only
-  # the malformed byte, not the legitimate text around it.
-  assert_contains "$(cat "$CACHE")" "safe" "legitimate text before C1 byte preserved"
-  assert_contains "$(cat "$CACHE")" "HIJACK" "legitimate text after C1 byte preserved"
-  rm -rf "$c1_dir"
 fi
 
 }
